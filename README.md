@@ -56,7 +56,7 @@ python3 deploy.py up
 | 参数 | 说明 |
 |------|------|
 | `-t, --token` | Cloudflare API Token (也可在 .env 中配置) |
-| `-r, --redirect` | 默认重定向 URL |
+| `-r, --redirect` | 默认重定向 URL (也可在 .env 中配置) |
 | `-u, --uuid` | 指定默认 UUID (也可在 .env 中配置) |
 | `--vless-ws-path` | 指定 VLESS WS 路径 (也可在 .env 中配置) |
 | `--vmess-ws-path` | 指定 VMess WS 路径 (也可在 .env 中配置) |
