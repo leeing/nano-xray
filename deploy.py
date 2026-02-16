@@ -184,13 +184,27 @@ def get_vnstat_monthly_tx_gb() -> float | None:
         if result.returncode != 0:
             return None
         data = json.loads(result.stdout)
-        # vnstat JSON: interfaces[0].traffic.month[-1].tx (bytes)
-        months = data.get("interfaces", [{}])[0].get("traffic", {}).get("month", [])
+
+        iface = data.get("interfaces", [{}])[0]
+        traffic = iface.get("traffic", {})
+        # vnstat 2.6 用 "months", 2.10+ 用 "month"
+        months = traffic.get("month", traffic.get("months", []))
         if not months:
             return 0.0
+
         latest = months[-1]
-        tx_bytes = latest.get("tx", 0)
-        return tx_bytes / (1024 ** 3)
+        tx_val = latest.get("tx", 0)
+
+        # vnstat JSON v1 (vnstat <2.10): tx 单位为 KiB
+        # vnstat JSON v2 (vnstat >=2.10): tx 单位为 bytes
+        json_ver = str(data.get("jsonversion", "1"))
+        if json_ver == "1":
+            tx_bytes = tx_val * 1024
+        else:
+            tx_bytes = tx_val
+
+        # 用 10^9 转 GB（与云厂商计费一致）
+        return tx_bytes / (10 ** 9)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, IndexError):
         return None
 
