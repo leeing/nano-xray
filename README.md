@@ -101,10 +101,11 @@ CF_API_TOKEN=xxx              # 必填
 DEFAULT_UUID=                 # 可选，init 时自动生成
 DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
 DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
-REDIRECT_URL=                 # 可选，默认 https://www.qadmlee.com
+REDIRECT_URL=                 # 可选，非 WS 路径重定向目标
 
-# 流量监控
+# 流量监控 (check-traffic 命令)
 TRAFFIC_LIMIT_GB=180          # 流量阈值 (GB)，check-traffic 必填
+VNSTAT_IFACE=ens4             # 可选，指定网卡（默认自动跳过 docker0/lo）
 TELEGRAM_BOT_TOKEN=           # 可选，告警通知
 TELEGRAM_CHAT_ID=             # 可选，告警通知
 ```
@@ -130,13 +131,23 @@ crontab -e
 0 * * * * cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1
 ```
 
+### 日志格式
+
+```
+2026-02-16 16:00 oregon | 1.10/180 GB | OK
+2026-02-16 17:00 oregon | 182.30/180 GB | BLOCKED
+2026-02-17 00:00 oregon | 0.05/180 GB | UNBLOCKED
+```
+
 ### 工作原理
 
-1. 读取 vnstat 当月出站流量 (tx)
-2. 流量 ≥ 阈值 → `ufw deny 443` 封端口 + Telegram 告警
-3. 流量 < 阈值且端口被封 → 自动解封 + Telegram 通知
-4. vnstat 不可用 → Telegram 告警
-5. 封禁后每小时重新检查并强制执行封禁（幂等）
+1. 自动识别真实网卡（跳过 docker0/lo/veth），也可通过 `VNSTAT_IFACE` 指定
+2. 读取 vnstat 当月出站流量 (tx)，用 GB (10⁹) 计算（与云厂商计费一致）
+3. 流量 ≥ 阈值 → `ufw deny 443` 封端口 + Telegram 告警（带主机名）
+4. 流量 < 阈值且端口被封 → 自动解封 + Telegram 通知
+5. vnstat 不可用 → Telegram 告警
+6. 封禁后每小时重新检查并强制执行封禁（幂等）
+7. 兼容 vnstat 2.6 (KiB) 和 2.10+ (bytes) JSON 格式
 
 ## 文件结构
 
