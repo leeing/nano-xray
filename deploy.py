@@ -21,8 +21,9 @@ from urllib.request import Request, urlopen
 #  常量
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+CADDY_IMAGE = "caddybuilds/caddy-cloudflare:latest"
+
 SCRIPT_DIR = Path(__file__).resolve().parent
-TEMPLATE_DIR = SCRIPT_DIR / "template"
 GENERATED_DIR = SCRIPT_DIR / "generated"
 SERVICES_FILE = SCRIPT_DIR / "services.json"
 ENV_FILE = SCRIPT_DIR / ".env"
@@ -331,7 +332,6 @@ class ConfigGenerator:
         GENERATED_DIR.mkdir(parents=True)
 
         self._generate_env()
-        self._copy_caddy_dockerfile()
         self._generate_caddyfile()
         self._generate_compose()
         self._generate_xray_configs()
@@ -340,12 +340,6 @@ class ConfigGenerator:
 
     def _generate_env(self) -> None:
         (GENERATED_DIR / ".env").write_text(f"CF_API_TOKEN={self.reg.cf_api_token}\n")
-
-    def _copy_caddy_dockerfile(self) -> None:
-        src = TEMPLATE_DIR / "caddy"
-        dst = GENERATED_DIR / "caddy"
-        if src.exists():
-            shutil.copytree(src, dst)
 
     def _generate_caddyfile(self) -> None:
         lines = [
@@ -406,7 +400,7 @@ class ConfigGenerator:
         lines = [
             "services:",
             "  caddy:",
-            "    build: ./caddy",
+            f"    image: {CADDY_IMAGE}",
             "    container_name: caddy",
             "    restart: always",
             "    ports:",
@@ -721,7 +715,7 @@ def cmd_up(args: argparse.Namespace) -> None:
 
     print()
     info("正在启动 Docker 服务...")
-    docker_compose("up", "-d", "--build")
+    docker_compose("up", "-d")
     print()
     info("所有服务已启动 ✓")
     print()
@@ -750,7 +744,7 @@ def cmd_reload(args: argparse.Namespace) -> None:
 
     if needs_restart:
         warn("检测到容器变更（新增/删除代理节点），需要 docker compose up")
-        docker_compose("up", "-d", "--build")
+        docker_compose("up", "-d")
         info("所有服务已更新 ✓")
     else:
         info("热加载 Caddy 配置...")
