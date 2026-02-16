@@ -69,6 +69,17 @@ python3 deploy.py up
 | `--no-dns` | add-proxy, add-service | 跳过自动 DNS 创建 |
 | `--keep-dns` | remove | 删除时保留 DNS 记录 |
 | `--new-uuid` | add-proxy | 强制生成新 UUID |
+| `--allow-ips` | add-service | IP 白名单，逗号分隔 (如 `1.2.3.0/24,5.6.7.8`) |
+
+### IP 白名单示例
+
+```bash
+# 仅允许指定 IP 访问管理后台
+python3 deploy.py add-service -d admin.example.com -t localhost:8080 --allow-ips 1.2.3.0/24,5.6.7.8
+
+# 不限制 IP
+python3 deploy.py add-service -d api.example.com -t localhost:9090
+```
 
 ## .env 配置
 

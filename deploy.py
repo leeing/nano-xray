@@ -377,15 +377,32 @@ class ConfigGenerator:
 
             elif svc["type"] == "service":
                 target = svc["target"]
-                lines.extend([
-                    f"{domain} {{",
-                    "\ttls {",
-                    "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
-                    "\t}",
-                    "",
-                    f"\treverse_proxy {target}",
-                    "}",
-                ])
+                allowed_ips = svc.get("allowed_ips", [])
+                if allowed_ips:
+                    ips_str = " ".join(allowed_ips)
+                    lines.extend([
+                        f"{domain} {{",
+                        "\ttls {",
+                        "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                        "\t}",
+                        "",
+                        f"\t@allowed remote_ip {ips_str}",
+                        "\thandle @allowed {",
+                        f"\t\treverse_proxy {target}",
+                        "\t}",
+                        "\trespond 403",
+                        "}",
+                    ])
+                else:
+                    lines.extend([
+                        f"{domain} {{",
+                        "\ttls {",
+                        "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                        "\t}",
+                        "",
+                        f"\treverse_proxy {target}",
+                        "}",
+                    ])
 
         (GENERATED_DIR / "Caddyfile").write_text("\n".join(lines) + "\n")
 
@@ -634,14 +651,19 @@ def cmd_add_service(args: argparse.Namespace) -> None:
             info("已取消")
             return
 
+    allowed_ips = [ip.strip() for ip in args.allow_ips.split(",") if ip.strip()] if args.allow_ips else []
+
     service = {
         "type": "service",
         "domain": args.domain,
         "target": args.target,
+        "allowed_ips": allowed_ips,
     }
     reg.add_service(service)
 
     info(f"已添加服务反代: {args.domain} → {args.target}")
+    if allowed_ips:
+        info(f"IP 白名单: {', '.join(allowed_ips)}")
     print()
 
     if not args.no_dns:
@@ -784,6 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_svc.add_argument("-t", "--target", required=True, help="后端地址 (如 localhost:8317)")
     p_svc.add_argument("--no-dns", action="store_true", help="不自动创建 DNS 记录")
     p_svc.add_argument("-f", "--force", action="store_true", help="域名已存在时强制覆盖")
+    p_svc.add_argument("--allow-ips", default="", help="IP 白名单，逗号分隔 (如 1.2.3.0/24,5.6.7.8)")
     p_svc.set_defaults(func=cmd_add_service)
 
     # remove
