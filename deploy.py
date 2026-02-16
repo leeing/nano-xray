@@ -527,9 +527,9 @@ def cmd_init(args: argparse.Namespace) -> None:
             info("已取消")
             return
 
-    # 从 CLI > 环境变量 > .env 文件 读取
     cf_token = get_env("CF_API_TOKEN", args.token, dotenv)
     default_uuid = get_env("DEFAULT_UUID", args.uuid, dotenv) or generate_uuid()
+    redirect_url = get_env("REDIRECT_URL", args.redirect, dotenv) or "https://www.qadmlee.com"
     vless_path = get_env("DEFAULT_VLESS_WS_PATH", args.vless_ws_path, dotenv) or generate_random_path()
     vmess_path = get_env("DEFAULT_VMESS_WS_PATH", args.vmess_ws_path, dotenv) or generate_random_path()
 
@@ -543,7 +543,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     registry = Registry(
         cf_api_token=cf_token,
-        redirect_url=args.redirect,
+        redirect_url=redirect_url,
         server_ip=server_ip,
         default_uuid=default_uuid,
         default_vless_ws_path=vless_path,
@@ -763,7 +763,7 @@ def build_parser() -> argparse.ArgumentParser:
     # init
     p_init = sub.add_parser("init", help="初始化项目")
     p_init.add_argument("-t", "--token", default="", help="Cloudflare API Token (也可在 .env 中配置)")
-    p_init.add_argument("-r", "--redirect", default="https://www.qadmlee.com", help="默认重定向 URL")
+    p_init.add_argument("-r", "--redirect", default="", help="默认重定向 URL (也可在 .env 中配置)")
     p_init.add_argument("-u", "--uuid", default="", help="指定默认 UUID (也可在 .env 中配置)")
     p_init.add_argument("--vless-ws-path", default="", help="指定 VLESS WS 路径 (也可在 .env 中配置)")
     p_init.add_argument("--vmess-ws-path", default="", help="指定 VMess WS 路径 (也可在 .env 中配置)")

@@ -79,6 +79,7 @@ CF_API_TOKEN=xxx              # 必填
 DEFAULT_UUID=                 # 可选，init 时自动生成
 DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
 DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
+REDIRECT_URL=                 # 可选，默认 https://www.qadmlee.com
 ```
 
 优先级：**CLI 参数 > 环境变量 > `.env` 文件**
