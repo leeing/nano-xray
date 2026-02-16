@@ -30,7 +30,7 @@ jobs:
       - name: Smoke test — init
         run: |
           echo 'CF_API_TOKEN=test' > .env
-          python deploy.py init --no-input
+          python deploy.py init
 
       - name: Smoke test — add-proxy
         run: python deploy.py add-proxy -d test.example.com --no-dns
