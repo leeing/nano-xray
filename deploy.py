@@ -159,6 +159,53 @@ def generate_random_path() -> str:
     return f"/{secrets.token_hex(4)}"
 
 
+def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
+    """发送 Telegram 消息，失败静默返回 False。"""
+    if not bot_token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = json.dumps({"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}).encode()
+    req = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except (HTTPError, URLError, OSError):
+        return False
+
+
+def get_vnstat_monthly_tx_gb() -> float | None:
+    """读取 vnstat 当月出站流量 (GB)。返回 None 表示 vnstat 不可用。"""
+    try:
+        result = subprocess.run(
+            ["vnstat", "--json", "m"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        # vnstat JSON: interfaces[0].traffic.month[-1].tx (bytes)
+        months = data.get("interfaces", [{}])[0].get("traffic", {}).get("month", [])
+        if not months:
+            return 0.0
+        latest = months[-1]
+        tx_bytes = latest.get("tx", 0)
+        return tx_bytes / (1024 ** 3)
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, IndexError):
+        return None
+
+
+def ufw_block_ports() -> None:
+    """封锁 80/443 端口。"""
+    for rule in ["deny 80/tcp", "deny 443/tcp", "deny 443/udp"]:
+        subprocess.run(["ufw", *rule.split()], capture_output=True)
+
+
+def ufw_allow_ports() -> None:
+    """放行 80/443 端口。"""
+    for rule in ["allow 80/tcp", "allow 443/tcp", "allow 443/udp"]:
+        subprocess.run(["ufw", *rule.split()], capture_output=True)
+
+
 def detect_public_ip() -> str:
     urls = [
         "https://ifconfig.me",
@@ -771,6 +818,62 @@ def cmd_reload(args: argparse.Namespace) -> None:
     docker_compose("ps")
 
 
+def cmd_check_traffic(args: argparse.Namespace) -> None:
+    dotenv = parse_dotenv()
+    limit_gb_str = get_env("TRAFFIC_LIMIT_GB", "", dotenv)
+    bot_token = get_env("TELEGRAM_BOT_TOKEN", "", dotenv)
+    chat_id = get_env("TELEGRAM_CHAT_ID", "", dotenv)
+
+    if not limit_gb_str:
+        error("未配置 TRAFFIC_LIMIT_GB，请在 .env 中设置")
+        sys.exit(1)
+
+    try:
+        limit_gb = float(limit_gb_str)
+    except ValueError:
+        error(f"TRAFFIC_LIMIT_GB 值无效: {limit_gb_str}")
+        sys.exit(1)
+
+    # 检查 vnstat
+    tx_gb = get_vnstat_monthly_tx_gb()
+    if tx_gb is None:
+        msg = "⚠️ *nano-xray 流量监控*\nvnstat 未运行或不可用，无法监控流量！"
+        warn("vnstat 未运行或不可用")
+        send_telegram(bot_token, chat_id, msg)
+        sys.exit(1)
+
+    info(f"当月出站流量: {tx_gb:.2f} GB / {limit_gb:.0f} GB")
+
+    if tx_gb >= limit_gb:
+        # 超限 → 封端口（幂等，每次 check 都强制执行）
+        ufw_block_ports()
+        msg = (
+            f"🚨 *nano-xray 流量超限*\n"
+            f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
+            f"已自动封锁 80/443 端口"
+        )
+        warn(f"流量超限！已封锁 80/443 端口")
+        send_telegram(bot_token, chat_id, msg)
+    else:
+        # 未超限 → 检查是否需要解封
+        result = subprocess.run(
+            ["ufw", "status"],
+            capture_output=True, text=True,
+        )
+        if "443/tcp" in result.stdout and "DENY" in result.stdout:
+            # 之前被封过，现在流量未超（新月） → 解封
+            ufw_allow_ports()
+            msg = (
+                f"✅ *nano-xray 流量恢复*\n"
+                f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
+                f"已自动解封 80/443 端口"
+            )
+            info("端口已解封")
+            send_telegram(bot_token, chat_id, msg)
+        else:
+            info("流量正常，无需操作")
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CLI 入口
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -830,6 +933,10 @@ def build_parser() -> argparse.ArgumentParser:
     # reload
     p_reload = sub.add_parser("reload", help="重新生成配置并热加载（零停机）")
     p_reload.set_defaults(func=cmd_reload)
+
+    # check-traffic
+    p_traffic = sub.add_parser("check-traffic", help="检查当月流量，超限自动封端口")
+    p_traffic.set_defaults(func=cmd_check_traffic)
 
     return parser
 

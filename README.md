@@ -50,6 +50,7 @@ python3 deploy.py up
 | `up` | 生成配置 + 启动 Docker (首次) |
 | `reload` | 生成配置 + 热加载 (日常) |
 | `generate` | 仅生成配置文件 |
+| `check-traffic` | 检查当月流量，超限自动封端口 |
 
 ### init 参数
 
@@ -91,9 +92,41 @@ DEFAULT_UUID=                 # 可选，init 时自动生成
 DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
 DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
 REDIRECT_URL=                 # 可选，默认 https://www.qadmlee.com
+
+# 流量监控
+TRAFFIC_LIMIT_GB=180          # 流量阈值 (GB)，check-traffic 必填
+TELEGRAM_BOT_TOKEN=           # 可选，告警通知
+TELEGRAM_CHAT_ID=             # 可选，告警通知
 ```
 
 优先级：**CLI 参数 > 环境变量 > `.env` 文件**
+
+## 流量监控
+
+防止 GCP 等云服务流量超额计费。基于 vnstat + ufw，支持 Telegram 告警。
+
+### 前提
+
+```bash
+apt install vnstat    # 流量统计
+ufw enable            # 防火墙已启用
+```
+
+### 配置 cron
+
+```bash
+# 每小时检查一次
+crontab -e
+0 * * * * cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1
+```
+
+### 工作原理
+
+1. 读取 vnstat 当月出站流量 (tx)
+2. 流量 ≥ 阈值 → `ufw deny 443` 封端口 + Telegram 告警
+3. 流量 < 阈值且端口被封 → 自动解封 + Telegram 通知
+4. vnstat 不可用 → Telegram 告警
+5. 封禁后每小时重新检查并强制执行封禁（幂等）
 
 ## 文件结构
 
