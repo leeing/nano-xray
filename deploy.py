@@ -223,14 +223,23 @@ def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | No
         return None
 
 
+def _has_ufw() -> bool:
+    """检查 ufw 是否可用。"""
+    return shutil.which("ufw") is not None
+
+
 def ufw_block_ports() -> None:
     """封锁 80/443 端口。"""
+    if not _has_ufw():
+        return
     for rule in ["deny 80/tcp", "deny 443/tcp", "deny 443/udp"]:
         subprocess.run(["ufw", *rule.split()], capture_output=True)
 
 
 def ufw_allow_ports() -> None:
     """放行 80/443 端口。"""
+    if not _has_ufw():
+        return
     for rule in ["allow 80/tcp", "allow 443/tcp", "allow 443/udp"]:
         subprocess.run(["ufw", *rule.split()], capture_output=True)
 
@@ -890,11 +899,15 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
         )
         send_telegram(bot_token, chat_id, msg)
     else:
-        result = subprocess.run(
-            ["ufw", "status"],
-            capture_output=True, text=True,
-        )
-        if "443/tcp" in result.stdout and "DENY" in result.stdout:
+        if _has_ufw():
+            result = subprocess.run(
+                ["ufw", "status"],
+                capture_output=True, text=True,
+            )
+            ports_blocked = "443/tcp" in result.stdout and "DENY" in result.stdout
+        else:
+            ports_blocked = False
+        if ports_blocked:
             ufw_allow_ports()
             print(f"{ts} {host} | {usage} | UNBLOCKED")
             msg = (
