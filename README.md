@@ -51,6 +51,7 @@ python3 deploy.py up
 | `reload` | 生成配置 + 热加载 (日常) |
 | `generate` | 仅生成配置文件 |
 | `check-traffic` | 检查当月流量，超限自动封端口 |
+| `update-ips -d <域名>` | 管理服务 IP 白名单 |
 
 ### init 参数
 
@@ -75,8 +76,17 @@ python3 deploy.py up
 ### IP 白名单示例
 
 ```bash
-# 仅允许指定 IP 访问管理后台
+# 初始设置白名单
 python3 deploy.py add-service -d admin.example.com -t localhost:8080 --allow-ips 1.2.3.0/24,5.6.7.8
+
+# 追加 IP
+python3 deploy.py update-ips -d admin.example.com --add 10.0.0.0/8
+
+# 删除 IP
+python3 deploy.py update-ips -d admin.example.com --remove 5.6.7.8
+
+# 查看当前白名单
+python3 deploy.py update-ips -d admin.example.com --list
 
 # 不限制 IP
 python3 deploy.py add-service -d api.example.com -t localhost:9090

@@ -874,6 +874,64 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
             info("流量正常，无需操作")
 
 
+def cmd_update_ips(args: argparse.Namespace) -> None:
+    reg = Registry.load()
+    svc = reg.find_domain(args.domain)
+
+    if not svc:
+        error(f"域名 {args.domain} 不存在")
+        sys.exit(1)
+
+    if svc["type"] != "service":
+        error(f"{args.domain} 是代理节点，不支持 IP 白名单")
+        sys.exit(1)
+
+    current_ips: list[str] = svc.get("allowed_ips", [])
+
+    # --list
+    if args.list_ips:
+        if current_ips:
+            info(f"{args.domain} 当前白名单:")
+            for ip in current_ips:
+                print(f"  - {ip}")
+        else:
+            info(f"{args.domain} 无 IP 白名单（允许所有）")
+        return
+
+    changed = False
+
+    # --add
+    if args.add:
+        new_ips = [ip.strip() for ip in args.add.split(",") if ip.strip()]
+        for ip in new_ips:
+            if ip not in current_ips:
+                current_ips.append(ip)
+                info(f"已添加: {ip}")
+                changed = True
+            else:
+                warn(f"已存在: {ip}")
+
+    # --remove
+    if args.remove:
+        rm_ips = [ip.strip() for ip in args.remove.split(",") if ip.strip()]
+        for ip in rm_ips:
+            if ip in current_ips:
+                current_ips.remove(ip)
+                info(f"已删除: {ip}")
+                changed = True
+            else:
+                warn(f"不存在: {ip}")
+
+    if changed:
+        svc["allowed_ips"] = current_ips
+        reg.save()
+        info(f"当前白名单: {', '.join(current_ips) if current_ips else '无（允许所有）'}")
+        warn("运行 'deploy.py reload' 使配置生效")
+    elif not args.add and not args.remove:
+        error("请指定 --add、--remove 或 --list")
+        sys.exit(1)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CLI 入口
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -937,6 +995,14 @@ def build_parser() -> argparse.ArgumentParser:
     # check-traffic
     p_traffic = sub.add_parser("check-traffic", help="检查当月流量，超限自动封端口")
     p_traffic.set_defaults(func=cmd_check_traffic)
+
+    # update-ips
+    p_ips = sub.add_parser("update-ips", help="管理服务 IP 白名单")
+    p_ips.add_argument("-d", "--domain", required=True, help="服务域名")
+    p_ips.add_argument("--add", default="", help="添加 IP，逗号分隔")
+    p_ips.add_argument("--remove", default="", help="删除 IP，逗号分隔")
+    p_ips.add_argument("--list", dest="list_ips", action="store_true", help="列出当前白名单")
+    p_ips.set_defaults(func=cmd_update_ips)
 
     return parser
 
