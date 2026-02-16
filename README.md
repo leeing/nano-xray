@@ -51,7 +51,17 @@ python3 deploy.py up
 | `reload` | 生成配置 + 热加载 (日常) |
 | `generate` | 仅生成配置文件 |
 
-### 常用参数
+### init 参数
+
+| 参数 | 说明 |
+|------|------|
+| `-t, --token` | Cloudflare API Token (也可在 .env 中配置) |
+| `-r, --redirect` | 默认重定向 URL |
+| `-u, --uuid` | 指定默认 UUID (也可在 .env 中配置) |
+| `--vless-ws-path` | 指定 VLESS WS 路径 (也可在 .env 中配置) |
+| `--vmess-ws-path` | 指定 VMess WS 路径 (也可在 .env 中配置) |
+
+### 通用参数
 
 | 参数 | 适用命令 | 说明 |
 |------|---------|------|
@@ -71,18 +81,16 @@ DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
 DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
 ```
 
-优先级：CLI 参数 > 环境变量 > `.env` 文件
+优先级：**CLI 参数 > 环境变量 > `.env` 文件**
 
 ## 文件结构
 
 ```
 nano-xray/
-├── deploy.py              ← 管理脚本
+├── deploy.py              ← 管理脚本 (零依赖单文件)
 ├── .env                   ← 环境配置 (不提交 Git)
 ├── .env.example           ← 配置模板
 ├── services.json          ← 服务注册表 (自动生成)
-├── template/
-│   └── caddy/Dockerfile   ← Caddy 构建模板
 └── generated/             ← 自动生成的部署文件
     ├── Caddyfile
     ├── docker-compose.yml

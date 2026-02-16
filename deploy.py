@@ -530,8 +530,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     # 从 CLI > 环境变量 > .env 文件 读取
     cf_token = get_env("CF_API_TOKEN", args.token, dotenv)
     default_uuid = get_env("DEFAULT_UUID", args.uuid, dotenv) or generate_uuid()
-    vless_path = get_env("DEFAULT_VLESS_WS_PATH", "", dotenv) or generate_random_path()
-    vmess_path = get_env("DEFAULT_VMESS_WS_PATH", "", dotenv) or generate_random_path()
+    vless_path = get_env("DEFAULT_VLESS_WS_PATH", args.vless_ws_path, dotenv) or generate_random_path()
+    vmess_path = get_env("DEFAULT_VMESS_WS_PATH", args.vmess_ws_path, dotenv) or generate_random_path()
 
     # 检测公网 IP
     info("正在检测服务器公网 IP...")
@@ -765,6 +765,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("-t", "--token", default="", help="Cloudflare API Token (也可在 .env 中配置)")
     p_init.add_argument("-r", "--redirect", default="https://www.qadmlee.com", help="默认重定向 URL")
     p_init.add_argument("-u", "--uuid", default="", help="指定默认 UUID (也可在 .env 中配置)")
+    p_init.add_argument("--vless-ws-path", default="", help="指定 VLESS WS 路径 (也可在 .env 中配置)")
+    p_init.add_argument("--vmess-ws-path", default="", help="指定 VMess WS 路径 (也可在 .env 中配置)")
     p_init.set_defaults(func=cmd_init)
 
     # add-proxy
