@@ -419,7 +419,7 @@ class ConfigGenerator:
                     f"\t\tnot path {vless_path}",
                     f"\t\tnot path {vmess_path}",
                     "\t}",
-                    f"\tredir @not_ws {redirect}{{uri}} permanent",
+                    f"\tredir @not_ws {redirect} permanent",
                     "}",
                 ])
 
