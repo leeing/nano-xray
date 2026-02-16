@@ -487,7 +487,7 @@ class ConfigGenerator:
             lines.extend([
                 "",
                 f"  {cn}:",
-                "    image: ghcr.io/xtls/xray-core:v26.2.6",
+                "    image: ghcr.io/xtls/xray-core:latest",
                 f"    container_name: {cn}",
                 "    restart: always",
                 '    command: ["run", "-config", "/etc/xray/config.json"]',
