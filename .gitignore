@@ -1,0 +1,8 @@
+# 自动生成的部署文件
+generated/
+
+# 服务注册表（含敏感 token）
+services.json
+
+# 旧的 output 目录
+output/
