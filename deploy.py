@@ -823,61 +823,61 @@ def cmd_reload(args: argparse.Namespace) -> None:
 
 
 def cmd_check_traffic(args: argparse.Namespace) -> None:
+    from datetime import datetime
+
     dotenv = load_dotenv()
     limit_gb_str = get_env("TRAFFIC_LIMIT_GB", "", dotenv)
     bot_token = get_env("TELEGRAM_BOT_TOKEN", "", dotenv)
     chat_id = get_env("TELEGRAM_CHAT_ID", "", dotenv)
+    host = socket.gethostname()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     if not limit_gb_str:
-        error("未配置 TRAFFIC_LIMIT_GB，请在 .env 中设置")
+        print(f"{ts} {host} | ERROR: TRAFFIC_LIMIT_GB not set")
         sys.exit(1)
 
     try:
         limit_gb = float(limit_gb_str)
     except ValueError:
-        error(f"TRAFFIC_LIMIT_GB 值无效: {limit_gb_str}")
+        print(f"{ts} {host} | ERROR: TRAFFIC_LIMIT_GB invalid: {limit_gb_str}")
         sys.exit(1)
 
-    # 检查 vnstat
     tx_gb = get_vnstat_monthly_tx_gb()
     if tx_gb is None:
-        msg = f"⚠️ *nano-xray 流量监控*\n主机: `{socket.gethostname()}`\nvnstat 未运行或不可用，无法监控流量！"
-        warn("vnstat 未运行或不可用")
+        print(f"{ts} {host} | ERROR: vnstat unavailable")
+        msg = f"⚠️ *nano-xray 流量监控*\n主机: `{host}`\nvnstat 未运行或不可用，无法监控流量！"
         send_telegram(bot_token, chat_id, msg)
         sys.exit(1)
 
-    info(f"当月出站流量: {tx_gb:.2f} GB / {limit_gb:.0f} GB")
+    usage = f"{tx_gb:.2f}/{limit_gb:.0f} GB"
 
     if tx_gb >= limit_gb:
-        # 超限 → 封端口（幂等，每次 check 都强制执行）
         ufw_block_ports()
+        print(f"{ts} {host} | {usage} | BLOCKED")
         msg = (
             f"🚨 *nano-xray 流量超限*\n"
-            f"主机: `{socket.gethostname()}`\n"
+            f"主机: `{host}`\n"
             f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
             f"已自动封锁 80/443 端口"
         )
-        warn(f"流量超限！已封锁 80/443 端口")
         send_telegram(bot_token, chat_id, msg)
     else:
-        # 未超限 → 检查是否需要解封
         result = subprocess.run(
             ["ufw", "status"],
             capture_output=True, text=True,
         )
         if "443/tcp" in result.stdout and "DENY" in result.stdout:
-            # 之前被封过，现在流量未超（新月） → 解封
             ufw_allow_ports()
+            print(f"{ts} {host} | {usage} | UNBLOCKED")
             msg = (
                 f"✅ *nano-xray 流量恢复*\n"
-                f"主机: `{socket.gethostname()}`\n"
+                f"主机: `{host}`\n"
                 f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
                 f"已自动解封 80/443 端口"
             )
-            info("端口已解封")
             send_telegram(bot_token, chat_id, msg)
         else:
-            info("流量正常，无需操作")
+            print(f"{ts} {host} | {usage} | OK")
 
 
 def cmd_update_ips(args: argparse.Namespace) -> None:
