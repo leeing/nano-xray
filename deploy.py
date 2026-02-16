@@ -823,7 +823,7 @@ def cmd_reload(args: argparse.Namespace) -> None:
 
 
 def cmd_check_traffic(args: argparse.Namespace) -> None:
-    dotenv = parse_dotenv()
+    dotenv = load_dotenv()
     limit_gb_str = get_env("TRAFFIC_LIMIT_GB", "", dotenv)
     bot_token = get_env("TELEGRAM_BOT_TOKEN", "", dotenv)
     chat_id = get_env("TELEGRAM_CHAT_ID", "", dotenv)
