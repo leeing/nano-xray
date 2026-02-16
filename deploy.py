@@ -185,7 +185,22 @@ def get_vnstat_monthly_tx_gb() -> float | None:
             return None
         data = json.loads(result.stdout)
 
-        iface = data.get("interfaces", [{}])[0]
+        # 找到真实网卡（跳过 docker0, lo, veth*, br-* 等虚拟接口）
+        virtual_prefixes = ("docker", "lo", "veth", "br-", "virbr")
+        iface = None
+        override = os.environ.get("VNSTAT_IFACE", "")
+        for itf in data.get("interfaces", []):
+            name = itf.get("name", "")
+            if override and name == override:
+                iface = itf
+                break
+            if not any(name.startswith(p) for p in virtual_prefixes):
+                iface = itf
+                break
+
+        if iface is None:
+            return None
+
         traffic = iface.get("traffic", {})
         # vnstat 2.6 用 "months", 2.10+ 用 "month"
         months = traffic.get("month", traffic.get("months", []))
@@ -195,15 +210,14 @@ def get_vnstat_monthly_tx_gb() -> float | None:
         latest = months[-1]
         tx_val = latest.get("tx", 0)
 
-        # vnstat JSON v1 (vnstat <2.10): tx 单位为 KiB
-        # vnstat JSON v2 (vnstat >=2.10): tx 单位为 bytes
+        # vnstat JSON v1 (<2.10): tx 单位为 KiB
+        # vnstat JSON v2 (>=2.10): tx 单位为 bytes
         json_ver = str(data.get("jsonversion", "1"))
         if json_ver == "1":
             tx_bytes = tx_val * 1024
         else:
             tx_bytes = tx_val
 
-        # 用 10^9 转 GB（与云厂商计费一致）
         return tx_bytes / (10 ** 9)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, IndexError):
         return None
