@@ -174,7 +174,7 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
         return False
 
 
-def get_vnstat_monthly_tx_gb() -> float | None:
+def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | None:
     """读取 vnstat 当月出站流量 (GB)。返回 None 表示 vnstat 不可用。"""
     try:
         result = subprocess.run(
@@ -188,7 +188,7 @@ def get_vnstat_monthly_tx_gb() -> float | None:
         # 找到真实网卡（跳过 docker0, lo, veth*, br-* 等虚拟接口）
         virtual_prefixes = ("docker", "lo", "veth", "br-", "virbr")
         iface = None
-        override = os.environ.get("VNSTAT_IFACE", "")
+        override = get_env("VNSTAT_IFACE", "", dotenv)
         for itf in data.get("interfaces", []):
             name = itf.get("name", "")
             if override and name == override:
@@ -870,7 +870,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
         print(f"{ts} {host} | ERROR: TRAFFIC_LIMIT_GB invalid: {limit_gb_str}")
         sys.exit(1)
 
-    tx_gb = get_vnstat_monthly_tx_gb()
+    tx_gb = get_vnstat_monthly_tx_gb(dotenv)
     if tx_gb is None:
         print(f"{ts} {host} | ERROR: vnstat unavailable")
         msg = f"⚠️ *nano-xray 流量监控*\n主机: `{host}`\nvnstat 未运行或不可用，无法监控流量！"
