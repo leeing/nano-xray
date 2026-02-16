@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import uuid
@@ -837,7 +838,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
     # 检查 vnstat
     tx_gb = get_vnstat_monthly_tx_gb()
     if tx_gb is None:
-        msg = "⚠️ *nano-xray 流量监控*\nvnstat 未运行或不可用，无法监控流量！"
+        msg = f"⚠️ *nano-xray 流量监控*\n主机: `{socket.gethostname()}`\nvnstat 未运行或不可用，无法监控流量！"
         warn("vnstat 未运行或不可用")
         send_telegram(bot_token, chat_id, msg)
         sys.exit(1)
@@ -849,6 +850,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
         ufw_block_ports()
         msg = (
             f"🚨 *nano-xray 流量超限*\n"
+            f"主机: `{socket.gethostname()}`\n"
             f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
             f"已自动封锁 80/443 端口"
         )
@@ -865,6 +867,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
             ufw_allow_ports()
             msg = (
                 f"✅ *nano-xray 流量恢复*\n"
+                f"主机: `{socket.gethostname()}`\n"
                 f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
                 f"已自动解封 80/443 端口"
             )
