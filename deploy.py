@@ -416,7 +416,7 @@ class ConfigGenerator:
                 "    image: ghcr.io/xtls/xray-core:latest",
                 f"    container_name: {cn}",
                 "    restart: always",
-                '    command: ["xray", "run", "-config", "/etc/xray/config.json"]',
+                '    command: ["run", "-config", "/etc/xray/config.json"]',
                 "    volumes:",
                 f"      - ./xray/{cn}/config.json:/etc/xray/config.json",
                 "    expose:",
