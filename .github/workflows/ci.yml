@@ -1,9 +1,4 @@
-# GitHub Actions CI — Python (FastAPI / CLI)
-# 复制到项目 .github/workflows/ci.yml
-#
-# 与项目规范 §4 Auto Gate 保持一致，形成双重保障：
-#   本地: hooks-setup (pre-commit) + Auto Gate
-#   CI:   本 workflow
+# GitHub Actions CI — nano-xray (零依赖单文件脚本)
 
 name: CI
 
@@ -20,35 +15,28 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
         with:
-          enable-cache: true
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: uv sync --frozen
+      - name: Syntax check
+        run: python -m py_compile deploy.py
 
-      # Auto Gate — 与项目规范 §4 完全一致
-      - name: Ruff format check
-        run: uv run ruff format --check .
+      - name: Smoke test — init
+        run: |
+          echo 'CF_API_TOKEN=test' > .env
+          python deploy.py init --no-input
 
-      - name: Ruff lint check
-        run: uv run ruff check .
+      - name: Smoke test — add-proxy
+        run: python deploy.py add-proxy -d test.example.com --no-dns
 
-      - name: Mypy type check
-        run: uv run mypy src/
-
-      - name: Run tests
-        run: uv run pytest tests/ -v --cov=src --cov-report=html
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-report
-          path: htmlcov/
-          retention-days: 30
+      - name: Smoke test — generate
+        run: |
+          python deploy.py generate
+          test -f generated/Caddyfile
+          test -f generated/docker-compose.yml
