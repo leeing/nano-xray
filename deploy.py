@@ -364,11 +364,8 @@ class ConfigGenerator:
                     "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
                     "\t}",
                     "",
-                    "\troute {",
-                    f"\t\treverse_proxy {vless_path} {container}:{VLESS_WS_PORT}",
-                    f"\t\treverse_proxy {vmess_path} {container}:{VMESS_WS_PORT}",
-                    f"\t\tredir * {redirect}{{uri}} permanent",
-                    "\t}",
+                    f"\treverse_proxy {vless_path} {container}:{VLESS_WS_PORT}",
+                    f"\treverse_proxy {vmess_path} {container}:{VMESS_WS_PORT}",
                     "}",
                 ])
 
