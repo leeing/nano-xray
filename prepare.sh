@@ -124,11 +124,20 @@ systemctl restart fail2ban
 # ── 9. Crontab（流量监控） ────────────────────────────────
 CRON_JOB="0 * * * * cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1"
 EXISTING_CRON=$(crontab -l 2>/dev/null || true)
-if ! echo "$EXISTING_CRON" | grep -qF "check-traffic"; then
-  (echo "$EXISTING_CRON"; echo "$CRON_JOB") | crontab -
-  info "  已添加流量监控 crontab ✓"
-else
+if echo "$EXISTING_CRON" | grep -qF "check-traffic"; then
   info "  流量监控 crontab 已存在，跳过"
+else
+  if [ -z "$EXISTING_CRON" ]; then
+    printf '%s\n' "$CRON_JOB" | crontab -
+  else
+    printf '%s\n%s\n' "$EXISTING_CRON" "$CRON_JOB" | crontab -
+  fi
+  # 验证是否成功写入
+  if crontab -l 2>/dev/null | grep -qF "check-traffic"; then
+    info "  已添加流量监控 crontab ✓"
+  else
+    warn "  crontab 写入失败，请手动添加: $CRON_JOB"
+  fi
 fi
 
 # ── 完成 ─────────────────────────────────────────────────
