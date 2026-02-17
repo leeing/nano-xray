@@ -7,3 +7,6 @@ services.json
 # 旧的 output 目录
 output/
 __pycache__/
+
+
+.env
