@@ -73,7 +73,6 @@ fi
 
 # ── 6. 网络调优（BBR + 代理优化） ────────────────────────
 info "配置网络参数..."
-touch /etc/sysctl.conf
 SYSCTL_PARAMS=(
   # BBR 拥塞控制
   "net.core.default_qdisc=fq"
@@ -94,6 +93,7 @@ SYSCTL_PARAMS=(
   "net.core.wmem_max=67108864"
 )
 
+touch /etc/sysctl.conf
 for param in "${SYSCTL_PARAMS[@]}"; do
   grep -qF "$param" /etc/sysctl.conf || echo "$param" >> /etc/sysctl.conf
 done
@@ -123,8 +123,9 @@ systemctl restart fail2ban
 
 # ── 9. Crontab（流量监控） ────────────────────────────────
 CRON_JOB="0 * * * * cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1"
-if ! crontab -l 2>/dev/null | grep -qF "check-traffic"; then
-  (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+EXISTING_CRON=$(crontab -l 2>/dev/null || true)
+if ! echo "$EXISTING_CRON" | grep -qF "check-traffic"; then
+  (echo "$EXISTING_CRON"; echo "$CRON_JOB") | crontab -
   info "  已添加流量监控 crontab ✓"
 else
   info "  流量监控 crontab 已存在，跳过"
