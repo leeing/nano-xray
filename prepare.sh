@@ -121,6 +121,15 @@ apt install -y fail2ban
 cp scripts/defaults-debian.conf /etc/fail2ban/jail.d/
 systemctl restart fail2ban
 
+# ── 9. Crontab（流量监控） ────────────────────────────────
+CRON_JOB="0 * * * * cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1"
+if ! crontab -l 2>/dev/null | grep -qF "check-traffic"; then
+  (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+  info "  已添加流量监控 crontab ✓"
+else
+  info "  流量监控 crontab 已存在，跳过"
+fi
+
 # ── 完成 ─────────────────────────────────────────────────
 echo ""
 info "========================================="
