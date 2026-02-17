@@ -73,6 +73,7 @@ fi
 
 # ── 6. 网络调优（BBR + 代理优化） ────────────────────────
 info "配置网络参数..."
+touch /etc/sysctl.conf
 SYSCTL_PARAMS=(
   # BBR 拥塞控制
   "net.core.default_qdisc=fq"
