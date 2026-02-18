@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import secrets
@@ -290,6 +291,23 @@ def confirm_prompt(message: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         print()
         return False
+
+
+def validate_ip_or_cidr(value: str) -> bool:
+    """校验 IP 地址或 CIDR 格式是否合法。支持 1.2.3.4、1.2.3.0/24 等。"""
+    try:
+        if "/" in value:
+            ipaddress.ip_network(value, strict=False)
+        else:
+            ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_ip_list(ips: list[str]) -> list[str]:
+    """校验 IP 列表，返回无效 IP 列表。空列表表示全部合法。"""
+    return [ip for ip in ips if not validate_ip_or_cidr(ip)]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -813,6 +831,11 @@ def cmd_add_service(args: argparse.Namespace) -> None:
         if args.allow_ips
         else []
     )
+    if allowed_ips:
+        invalid = validate_ip_list(allowed_ips)
+        if invalid:
+            error(f"无效的 IP 地址: {', '.join(invalid)}")
+            sys.exit(1)
 
     # Docker 容器内 localhost 指向容器自身，自动转换为宿主机地址
     target = args.target
@@ -1047,6 +1070,10 @@ def cmd_update_ips(args: argparse.Namespace) -> None:
     # --add
     if args.add:
         new_ips = [ip.strip() for ip in args.add.split(",") if ip.strip()]
+        invalid = validate_ip_list(new_ips)
+        if invalid:
+            error(f"无效的 IP 地址: {', '.join(invalid)}")
+            sys.exit(1)
         for ip in new_ips:
             if ip not in current_ips:
                 current_ips.append(ip)
