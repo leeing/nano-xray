@@ -237,8 +237,8 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
         return False
 
 
-def get_vnstat_monthly_tx_gib(dotenv: dict[str, str] | None = None) -> float | None:
-    """读取 vnstat 当月出站流量 (tx)，单位 GiB。返回 None 表示不可用。
+def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | None:
+    """读取 vnstat 当月出站流量 (tx)，单位 GB。返回 None 表示不可用。
 
     阿里云 CDT 对 ECS 按出向流量计费，因此只统计 tx。
     """
@@ -286,7 +286,7 @@ def get_vnstat_monthly_tx_gib(dotenv: dict[str, str] | None = None) -> float | N
         else:
             tx_bytes = tx_val
 
-        return tx_bytes / (1024**3)  # GiB
+        return tx_bytes / 1_000_000_000  # GB
     except (
         FileNotFoundError,
         subprocess.TimeoutExpired,
@@ -1341,27 +1341,27 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        limit_gib = float(limit_gb_str)
+        limit_gb = float(limit_gb_str)
     except ValueError:
         print(f"{ts} {host} | ERROR: TRAFFIC_LIMIT_GB invalid: {limit_gb_str}")
         sys.exit(1)
 
-    tx_gib = get_vnstat_monthly_tx_gib(dotenv)
-    if tx_gib is None:
+    tx_gb = get_vnstat_monthly_tx_gb(dotenv)
+    if tx_gb is None:
         print(f"{ts} {host} | ERROR: vnstat unavailable")
         msg = f"⚠️ *nano-xray 流量监控*\n主机: `{host}`\nvnstat 未运行或不可用，无法监控流量！"
         send_telegram(bot_token, chat_id, msg)
         sys.exit(1)
 
-    usage = f"{tx_gib:.2f}/{limit_gib:.0f} GiB"
+    usage = f"{tx_gb:.2f}/{limit_gb:.0f} GB"
 
-    if tx_gib >= limit_gib:
+    if tx_gb >= limit_gb:
         ufw_block_ports()
         print(f"{ts} {host} | {usage} | BLOCKED")
         msg = (
             f"🚨 *nano-xray 流量超限*\n"
             f"主机: `{host}`\n"
-            f"当月出站: `{tx_gib:.2f} GiB` / `{limit_gib:.0f} GiB`\n"
+            f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
             f"已自动封锁 80/443 端口"
         )
         send_telegram(bot_token, chat_id, msg)
@@ -1381,7 +1381,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
             msg = (
                 f"✅ *nano-xray 流量恢复*\n"
                 f"主机: `{host}`\n"
-                f"当月出站: `{tx_gib:.2f} GiB` / `{limit_gib:.0f} GiB`\n"
+                f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
                 f"已自动解封 80/443 端口"
             )
             send_telegram(bot_token, chat_id, msg)

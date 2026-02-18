@@ -145,15 +145,15 @@ crontab -e
 ### 日志格式
 
 ```
-2026-02-16 16:00 oregon | 1.10/180 GiB | OK
-2026-02-16 17:00 oregon | 182.30/180 GiB | BLOCKED
-2026-02-17 00:00 oregon | 0.05/180 GiB | UNBLOCKED
+2026-02-16 16:00 oregon | 1.10/180 GB | OK
+2026-02-16 17:00 oregon | 182.30/180 GB | BLOCKED
+2026-02-17 00:00 oregon | 0.05/180 GB | UNBLOCKED
 ```
 
 ### 工作原理
 
 1. 自动识别真实网卡（跳过 docker0/lo/veth），也可通过 `VNSTAT_IFACE` 指定
-2. 读取 vnstat 当月出站流量 (tx)，用 GiB (2³⁰) 计算
+2. 读取 vnstat 当月出站流量 (tx)，用 GB (10⁹) 计算
 3. 流量 ≥ 阈值 → `ufw deny 443` 封端口 + Telegram 告警（带主机名）
 4. 流量 < 阈值且端口被封 → 自动解封 + Telegram 通知
 5. vnstat 不可用 → Telegram 告警

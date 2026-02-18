@@ -29,7 +29,7 @@ jobs:
 
       - name: Smoke test — init
         run: |
-          echo 'CF_API_TOKEN=test' > .env
+          printf 'CF_API_TOKEN=test\nREDIRECT_URL=https://www.example.com\n' > .env
           python deploy.py init
 
       - name: Smoke test — add-proxy
