@@ -34,6 +34,59 @@ VMESS_WS_PORT = 2002
 CF_API = "https://api.cloudflare.com/client/v4"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  内嵌配置文件（替代 git clone 获取的外部文件）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_FAIL2BAN_CONF = """\
+[sshd]
+enabled = true
+port = 22
+maxretry = 2
+bantime = 2592000
+"""
+
+_ENV_TEMPLATE = """\
+# Cloudflare API Token (必填，权限: Zone DNS: Edit + Zone: Zone: Read)
+CF_API_TOKEN=
+
+# 以下为可选，init 时自动生成。如需固定值可在此指定
+# DEFAULT_UUID=
+# DEFAULT_VLESS_WS_PATH=
+# DEFAULT_VMESS_WS_PATH=
+# REDIRECT_URL=https://www.example.com
+
+# SSH 公钥（每行一个，支持多个: SSH_KEY_1, SSH_KEY_2, ...)
+# SSH_KEY_1=ssh-rsa AAAA... user1
+# SSH_KEY_2=ssh-ed25519 AAAA... user2
+
+# 流量监控 (check-traffic 命令)
+# TRAFFIC_LIMIT_GB=180
+# VNSTAT_IFACE=ens4
+# TELEGRAM_BOT_TOKEN=
+# TELEGRAM_CHAT_ID=
+"""
+
+_SYSCTL_PARAMS = [
+    # BBR 拥塞控制
+    "net.core.default_qdisc=fq",
+    "net.ipv4.tcp_congestion_control=bbr",
+    # TCP Fast Open（加速 TLS 握手）
+    "net.ipv4.tcp_fastopen=3",
+    # 空闲后不重置拥塞窗口
+    "net.ipv4.tcp_slow_start_after_idle=0",
+    # 自动探测 MTU，避免分片
+    "net.ipv4.tcp_mtu_probing=1",
+    # 连接队列上限
+    "net.ipv4.tcp_max_syn_backlog=8192",
+    "net.core.somaxconn=8192",
+    # TCP 缓冲区（最大 64MB，适合高带宽代理）
+    "net.ipv4.tcp_rmem=4096 87380 67108864",
+    "net.ipv4.tcp_wmem=4096 65536 67108864",
+    "net.core.rmem_max=67108864",
+    "net.core.wmem_max=67108864",
+]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  终端颜色
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -182,8 +235,11 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
         return False
 
 
-def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | None:
-    """读取 vnstat 当月出站流量 (GB)。返回 None 表示 vnstat 不可用。"""
+def get_vnstat_monthly_tx_gib(dotenv: dict[str, str] | None = None) -> float | None:
+    """读取 vnstat 当月出站流量 (tx)，单位 GiB。返回 None 表示不可用。
+
+    阿里云 CDT 对 ECS 按出向流量计费，因此只统计 tx。
+    """
     try:
         result = subprocess.run(
             ["vnstat", "--json", "m"],
@@ -220,15 +276,15 @@ def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | No
         latest = months[-1]
         tx_val = latest.get("tx", 0)
 
-        # vnstat JSON v1 (<2.10): tx 单位为 KiB
-        # vnstat JSON v2 (>=2.10): tx 单位为 bytes
+        # vnstat JSON v1 (<2.10): 单位为 KiB
+        # vnstat JSON v2 (>=2.10): 单位为 bytes
         json_ver = str(data.get("jsonversion", "1"))
         if json_ver == "1":
             tx_bytes = tx_val * 1024
         else:
             tx_bytes = tx_val
 
-        return tx_bytes / (10**9)
+        return tx_bytes / (1024**3)  # GiB
     except (
         FileNotFoundError,
         subprocess.TimeoutExpired,
@@ -349,7 +405,15 @@ class CloudflareClient:
         zones = result.get("result", [])
         return zones[0]["id"] if zones else ""
 
-    def create_or_update_dns(self, zone_id: str, domain: str, ip: str) -> bool:
+    def create_or_update_dns(
+        self, zone_id: str, domain: str, ip: str, *, force: bool = False
+    ) -> bool:
+        """创建或更新 DNS A 记录（幂等）。
+
+        - 记录不存在 → 创建
+        - 记录已存在且 IP 相同 → 跳过（幂等）
+        - 记录已存在但 IP 不同 → 报错（除非 force=True 强制覆盖）
+        """
         result = self._request(
             "GET", f"/zones/{zone_id}/dns_records?type=A&name={domain}"
         )
@@ -364,12 +428,22 @@ class CloudflareClient:
         }
 
         if existing:
+            old_ip = existing[0]["content"]
+            if old_ip == ip:
+                info(f"DNS 记录已存在且一致: {domain} → {ip}，跳过")
+                return True
+            if not force:
+                error(
+                    f"DNS 记录已存在: {domain} → {old_ip}（期望 {ip}）。"
+                    "使用 --force 强制覆盖"
+                )
+                return False
             record_id = existing[0]["id"]
             resp = self._request(
                 "PUT", f"/zones/{zone_id}/dns_records/{record_id}", record_data
             )
             if resp.get("success"):
-                info(f"已更新 DNS 记录: {domain} → {ip} (DNS only)")
+                info(f"已强制更新 DNS 记录: {domain} → {ip}（原: {old_ip}）")
                 return True
         else:
             resp = self._request("POST", f"/zones/{zone_id}/dns_records", record_data)
@@ -420,7 +494,7 @@ def ensure_zone_id(registry: Registry, domain: str) -> str:
     return zone_id
 
 
-def auto_create_dns(registry: Registry, domain: str) -> None:
+def auto_create_dns(registry: Registry, domain: str, *, force: bool = False) -> None:
     if not registry.server_ip:
         warn("服务器 IP 未配置，跳过 DNS 记录创建")
         return
@@ -433,7 +507,8 @@ def auto_create_dns(registry: Registry, domain: str) -> None:
         return
 
     cf = CloudflareClient(registry.cf_api_token)
-    cf.create_or_update_dns(zone_id, domain, registry.server_ip)
+    if not cf.create_or_update_dns(zone_id, domain, registry.server_ip, force=force):
+        sys.exit(1)
 
 
 def auto_delete_dns(registry: Registry, domain: str) -> None:
@@ -700,7 +775,269 @@ def docker_exec(*args: str) -> subprocess.CompletedProcess[str]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _ensure_env() -> None:
+    """检查 .env 文件是否存在，不存在则提示先执行 prepare。"""
+    if not ENV_FILE.exists():
+        error("请先运行: python3 deploy.py prepare")
+        sys.exit(1)
+
+
+def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    """封装 subprocess.run，统一错误处理。"""
+    return subprocess.run(cmd, **kwargs)  # noqa: S603
+
+
+def cmd_prepare(args: argparse.Namespace) -> None:
+    """服务器初始化（Python 化的 prepare.sh）。"""
+    if os.geteuid() != 0:
+        error("prepare 命令需要 root 权限，请使用 sudo 或 root 用户执行")
+        sys.exit(1)
+
+    # ── 0. 生成 .env ──
+    if ENV_FILE.exists():
+        info(".env 已存在，跳过生成")
+    else:
+        ENV_FILE.write_text(_ENV_TEMPLATE)
+        info("已生成 .env 文件，请编辑填入 CF_API_TOKEN")
+
+    # ── 1. 基础工具 ──
+    info("安装基础工具...")
+    _run(["apt", "update", "-y"])
+    _run(
+        [
+            "apt",
+            "install",
+            "-y",
+            "wget",
+            "git",
+            "curl",
+            "tmux",
+            "htop",
+            "sysstat",
+            "vnstat",
+        ]
+    )
+
+    # ── 2. SSH 公钥 ──
+    info("配置 SSH 公钥...")
+    ssh_dir = Path("/root/.ssh")
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    ssh_dir.chmod(0o700)
+
+    id_rsa = ssh_dir / "id_rsa"
+    if not id_rsa.exists():
+        _run(["ssh-keygen", "-t", "rsa", "-N", "", "-f", str(id_rsa)])
+        info("  生成服务器密钥对 ✓")
+
+    dotenv = load_dotenv()
+    ssh_keys = [v for k, v in sorted(dotenv.items()) if k.startswith("SSH_KEY_")]
+
+    if not ssh_keys:
+        warn("SSH_KEY_* 未在 .env 中配置，跳过公钥写入")
+    else:
+        auth_keys = ssh_dir / "authorized_keys"
+        existing_keys = auth_keys.read_text() if auth_keys.exists() else ""
+        for key in ssh_keys:
+            if key not in existing_keys:
+                with auth_keys.open("a") as f:
+                    f.write(key + "\n")
+                tag = key.split()[-1] if key.split() else "unknown"
+                info(f"  添加公钥: {tag}")
+        auth_keys.chmod(0o600)
+
+    # ── 3. 时区 ──
+    info("设置时区 Asia/Shanghai...")
+    _run(["timedatectl", "set-timezone", "Asia/Shanghai"])
+
+    # ── 4. SSH 加固（sed 修改关键行，保留系统原始配置） ──
+    info("配置 sshd...")
+    _run(
+        [
+            "sed",
+            "-i",
+            "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/",
+            "/etc/ssh/sshd_config",
+        ]
+    )
+    _run(
+        [
+            "sed",
+            "-i",
+            "s/^[# ]*PasswordAuthentication.*/PasswordAuthentication yes/",
+            "/etc/ssh/sshd_config",
+        ]
+    )
+    _run(["systemctl", "restart", "sshd"])
+
+    # ── 5. Docker ──
+    if shutil.which("docker"):
+        info("Docker 已安装，跳过")
+    else:
+        info("安装 Docker...")
+        # 清理旧包
+        old_pkgs = [
+            "docker.io",
+            "docker-compose",
+            "docker-doc",
+            "podman-docker",
+            "containerd",
+            "runc",
+        ]
+        for pkg in old_pkgs:
+            _run(["apt", "remove", "-y", pkg], capture_output=True)  # 忽略不存在的包
+
+        _run(["apt", "install", "-y", "ca-certificates", "curl"])
+
+        keyrings_dir = Path("/etc/apt/keyrings")
+        keyrings_dir.mkdir(parents=True, exist_ok=True)
+        keyrings_dir.chmod(0o755)
+
+        _run(
+            [
+                "curl",
+                "-fsSL",
+                "https://download.docker.com/linux/debian/gpg",
+                "-o",
+                "/etc/apt/keyrings/docker.asc",
+            ]
+        )
+        Path("/etc/apt/keyrings/docker.asc").chmod(0o644)
+
+        # 获取 VERSION_CODENAME
+        codename = ""
+        os_release = Path("/etc/os-release")
+        if os_release.exists():
+            for line in os_release.read_text().splitlines():
+                if line.startswith("VERSION_CODENAME="):
+                    codename = line.split("=", 1)[1].strip().strip('"')
+                    break
+
+        if not codename:
+            error("无法检测 Debian 版本代号")
+            sys.exit(1)
+
+        docker_source = (
+            "Types: deb\n"
+            "URIs: https://download.docker.com/linux/debian\n"
+            f"Suites: {codename}\n"
+            "Components: stable\n"
+            "Signed-By: /etc/apt/keyrings/docker.asc\n"
+        )
+        Path("/etc/apt/sources.list.d/docker.sources").write_text(docker_source)
+
+        _run(["apt", "update"])
+        _run(
+            [
+                "apt",
+                "install",
+                "-y",
+                "docker-ce",
+                "docker-ce-cli",
+                "containerd.io",
+                "docker-buildx-plugin",
+                "docker-compose-plugin",
+            ]
+        )
+        info("Docker 安装完成 ✓")
+
+    # ── 6. 网络调优（BBR + 代理优化） ──
+    info("配置网络参数...")
+    sysctl_file = Path("/etc/sysctl.conf")
+    sysctl_file.touch(exist_ok=True)
+    existing_sysctl = sysctl_file.read_text()
+    for param in _SYSCTL_PARAMS:
+        if param not in existing_sysctl:
+            with sysctl_file.open("a") as f:
+                f.write(param + "\n")
+    _run(["sysctl", "-p"])
+
+    # ── 7. UFW 防火墙 ──
+    info("配置 UFW...")
+    _run(["apt", "install", "-y", "ufw"])
+    _run(["ufw", "default", "deny", "incoming"])
+    _run(["ufw", "default", "allow", "outgoing"])
+    _run(["ufw", "allow", "22/tcp"])
+    _run(["ufw", "allow", "80/tcp"])
+    _run(["ufw", "allow", "443/tcp"])
+    _run(["ufw", "allow", "443/udp"])
+
+    result = _run(["ufw", "status"], capture_output=True, text=True)
+    if "Status: active" not in (result.stdout or ""):
+        _run(["bash", "-c", "yes | ufw enable"])
+        info("  UFW 已启用 ✓")
+    else:
+        info("  UFW 已处于活跃状态，跳过启用")
+
+    # ── 8. fail2ban ──
+    info("配置 fail2ban...")
+    _run(["apt", "install", "-y", "fail2ban"])
+    jail_dir = Path("/etc/fail2ban/jail.d")
+    jail_dir.mkdir(parents=True, exist_ok=True)
+    (jail_dir / "defaults-debian.conf").write_text(_FAIL2BAN_CONF)
+    _run(["systemctl", "restart", "fail2ban"])
+
+    # ── 9. Crontab（流量监控） ──
+    info("配置流量监控 crontab...")
+    work_dir = Path.cwd().resolve()
+    cron_job = f"0 * * * * cd {work_dir} && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1"
+
+    result = _run(["crontab", "-l"], capture_output=True, text=True)
+    existing_cron = result.stdout or ""
+
+    if "check-traffic" in existing_cron:
+        info("  流量监控 crontab 已存在，跳过")
+    else:
+        if existing_cron.strip():
+            new_cron = existing_cron.rstrip("\n") + "\n" + cron_job + "\n"
+        else:
+            new_cron = cron_job + "\n"
+        subprocess.run(
+            ["crontab", "-"],
+            input=new_cron,
+            text=True,
+            check=False,
+        )
+
+        # 验证
+        verify = _run(["crontab", "-l"], capture_output=True, text=True)
+        if "check-traffic" in (verify.stdout or ""):
+            info("  已添加流量监控 crontab ✓")
+        else:
+            warn(f"  crontab 写入失败，请手动添加: {cron_job}")
+
+    # ── 完成 ──
+    print()
+    info("=========================================")
+    info("  服务器初始化完成 ✓")
+    info("=========================================")
+
+    tz_result = _run(
+        ["timedatectl", "show", "-p", "Timezone", "--value"],
+        capture_output=True,
+        text=True,
+    )
+    docker_result = _run(["docker", "--version"], capture_output=True, text=True)
+    bbr_result = _run(
+        ["sysctl", "net.ipv4.tcp_congestion_control"],
+        capture_output=True,
+        text=True,
+    )
+    f2b_result = _run(
+        ["systemctl", "is-active", "fail2ban"],
+        capture_output=True,
+        text=True,
+    )
+
+    info(f"  时区: {(tz_result.stdout or '').strip()}")
+    info(f"  Docker: {(docker_result.stdout or '').strip()}")
+    info(f"  BBR: {(bbr_result.stdout or '').strip()}")
+    info(f"  fail2ban: {(f2b_result.stdout or '').strip()}")
+    print()
+    info("下一步: 编辑 .env 填入 CF_API_TOKEN，然后运行 python3 deploy.py init")
+
+
 def cmd_init(args: argparse.Namespace) -> None:
+    _ensure_env()
     dotenv = load_dotenv()
 
     if SERVICES_FILE.exists():
@@ -764,6 +1101,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_add_proxy(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
 
     existing = reg.find_domain(args.domain)
@@ -807,12 +1145,13 @@ def cmd_add_proxy(args: argparse.Namespace) -> None:
     print()
 
     if not args.no_dns:
-        auto_create_dns(reg, args.domain)
+        auto_create_dns(reg, args.domain, force=args.force)
 
     warn("运行 'deploy.py up' 使配置生效")
 
 
 def cmd_add_service(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
 
     existing = reg.find_domain(args.domain)
@@ -862,12 +1201,13 @@ def cmd_add_service(args: argparse.Namespace) -> None:
     print()
 
     if not args.no_dns:
-        auto_create_dns(reg, args.domain)
+        auto_create_dns(reg, args.domain, force=args.force)
 
     warn("运行 'deploy.py reload' 使配置生效（零停机）")
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
 
     svc = reg.remove_service(args.domain)
@@ -884,6 +1224,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
 
     if not reg.services:
@@ -922,11 +1263,13 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
     ConfigGenerator(reg).generate_all()
 
 
 def cmd_up(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
     ConfigGenerator(reg).generate_all()
 
@@ -940,6 +1283,7 @@ def cmd_up(args: argparse.Namespace) -> None:
 
 
 def cmd_reload(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
     ConfigGenerator(reg).generate_all()
     print()
@@ -979,6 +1323,7 @@ def cmd_reload(args: argparse.Namespace) -> None:
 
 
 def cmd_check_traffic(args: argparse.Namespace) -> None:
+    _ensure_env()
     from datetime import datetime
 
     dotenv = load_dotenv()
@@ -993,27 +1338,27 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        limit_gb = float(limit_gb_str)
+        limit_gib = float(limit_gb_str)
     except ValueError:
         print(f"{ts} {host} | ERROR: TRAFFIC_LIMIT_GB invalid: {limit_gb_str}")
         sys.exit(1)
 
-    tx_gb = get_vnstat_monthly_tx_gb(dotenv)
-    if tx_gb is None:
+    tx_gib = get_vnstat_monthly_tx_gib(dotenv)
+    if tx_gib is None:
         print(f"{ts} {host} | ERROR: vnstat unavailable")
         msg = f"⚠️ *nano-xray 流量监控*\n主机: `{host}`\nvnstat 未运行或不可用，无法监控流量！"
         send_telegram(bot_token, chat_id, msg)
         sys.exit(1)
 
-    usage = f"{tx_gb:.2f}/{limit_gb:.0f} GB"
+    usage = f"{tx_gib:.2f}/{limit_gib:.0f} GiB"
 
-    if tx_gb >= limit_gb:
+    if tx_gib >= limit_gib:
         ufw_block_ports()
         print(f"{ts} {host} | {usage} | BLOCKED")
         msg = (
             f"🚨 *nano-xray 流量超限*\n"
             f"主机: `{host}`\n"
-            f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
+            f"当月出站: `{tx_gib:.2f} GiB` / `{limit_gib:.0f} GiB`\n"
             f"已自动封锁 80/443 端口"
         )
         send_telegram(bot_token, chat_id, msg)
@@ -1033,7 +1378,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
             msg = (
                 f"✅ *nano-xray 流量恢复*\n"
                 f"主机: `{host}`\n"
-                f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
+                f"当月出站: `{tx_gib:.2f} GiB` / `{limit_gib:.0f} GiB`\n"
                 f"已自动解封 80/443 端口"
             )
             send_telegram(bot_token, chat_id, msg)
@@ -1042,6 +1387,7 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
 
 
 def cmd_update_ips(args: argparse.Namespace) -> None:
+    _ensure_env()
     reg = Registry.load()
     svc = reg.find_domain(args.domain)
 
@@ -1116,6 +1462,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="nano-xray — 单机多服务 Caddy 管理工具",
     )
     sub = parser.add_subparsers(dest="command", help="可用命令")
+
+    # prepare
+    p_prepare = sub.add_parser(
+        "prepare", help="服务器初始化（安装 Docker/BBR/UFW/fail2ban 等）"
+    )
+    p_prepare.set_defaults(func=cmd_prepare)
 
     # init
     p_init = sub.add_parser("init", help="初始化项目")

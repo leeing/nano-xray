@@ -13,19 +13,22 @@
 
 ## 前提
 
-1. Debian 服务器，已安装 `docker` 和 `docker compose`
+1. Debian 服务器（无需预装 Docker，`prepare` 命令会自动安装）
 2. 域名 DNS 托管在 Cloudflare
 3. Cloudflare API Token (权限: `Zone DNS: Edit` + `Zone: Zone: Read`)
 
 ## 快速开始
 
 ```bash
-# 克隆
-git clone <repo> && cd nano-xray
+# 下载脚本
+mkdir nano-xray && cd nano-xray
+curl -sLO https://s.qadmlee.com/deploy.py
 
-# 配置 .env
-cp .env.example .env
+# 服务器初始化（安装 Docker/BBR/UFW/fail2ban，生成 .env）
+python3 deploy.py prepare
+
 # 编辑 .env，填入 CF_API_TOKEN
+nano .env
 
 # 初始化（自动读取 .env）
 python3 deploy.py init
@@ -38,10 +41,13 @@ python3 deploy.py add-proxy -d jp.example.com
 python3 deploy.py up
 ```
 
+> **更新脚本**: `curl -sLO https://s.qadmlee.com/deploy.py`
+
 ## 命令
 
 | 命令 | 说明 |
 |------|------|
+| `prepare` | 服务器初始化 (安装 Docker/BBR/UFW/fail2ban，生成 .env) |
 | `init` | 初始化 (自动检测 IP、生成默认 UUID 和路径) |
 | `add-proxy -d <域名>` | 添加代理节点 (自动创建 DNS) |
 | `add-service -d <域名> -t <目标>` | 添加服务反代 (localhost 自动转为 host.docker.internal) |
@@ -95,7 +101,7 @@ python3 deploy.py update-ips -d admin.example.com --list
 
 ## .env 配置
 
-从 `.env.example` 复制并编辑：
+`prepare` 命令会自动生成 `.env` 模板，编辑填入即可：
 
 ```bash
 CF_API_TOKEN=xxx              # 必填
@@ -103,6 +109,10 @@ DEFAULT_UUID=                 # 可选，init 时自动生成
 DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
 DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
 REDIRECT_URL=                 # 可选，非 WS 路径重定向目标
+
+# SSH 公钥（支持多个：SSH_KEY_1, SSH_KEY_2, ...）
+SSH_KEY_1=ssh-rsa AAAA... user1
+SSH_KEY_2=ssh-ed25519 AAAA... user2
 
 # 流量监控 (check-traffic 命令)
 TRAFFIC_LIMIT_GB=180          # 流量阈值 (GB)，check-traffic 必填
