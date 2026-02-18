@@ -49,11 +49,13 @@ _ENV_TEMPLATE = """\
 # Cloudflare API Token (必填，权限: Zone DNS: Edit + Zone: Zone: Read)
 CF_API_TOKEN=
 
+# 重定向目标 URL (必填，非 WS 路径的请求会被重定向到此 URL)
+REDIRECT_URL=
+
 # 以下为可选，init 时自动生成。如需固定值可在此指定
 # DEFAULT_UUID=
 # DEFAULT_VLESS_WS_PATH=
 # DEFAULT_VMESS_WS_PATH=
-# REDIRECT_URL=https://www.example.com
 
 # SSH 公钥（每行一个，支持多个: SSH_KEY_1, SSH_KEY_2, ...)
 # SSH_KEY_1=ssh-rsa AAAA... user1
@@ -157,7 +159,7 @@ def get_env(key: str, cli_value: str = "", dotenv: dict[str, str] | None = None)
 @dataclass
 class Registry:
     cf_api_token: str = ""
-    redirect_url: str = "https://www.qadmlee.com"
+    redirect_url: str = ""
     server_ip: str = ""
     cf_zone_id: str = ""
     default_uuid: str = ""
@@ -1048,9 +1050,10 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     cf_token = get_env("CF_API_TOKEN", args.token, dotenv)
     default_uuid = get_env("DEFAULT_UUID", args.uuid, dotenv) or generate_uuid()
-    redirect_url = (
-        get_env("REDIRECT_URL", args.redirect, dotenv) or "https://www.qadmlee.com"
-    )
+    redirect_url = get_env("REDIRECT_URL", args.redirect, dotenv)
+    if not redirect_url:
+        error("REDIRECT_URL 未配置。请在 .env 中设置 REDIRECT_URL= 或使用 -r 参数")
+        sys.exit(1)
     vless_path = (
         get_env("DEFAULT_VLESS_WS_PATH", args.vless_ws_path, dotenv)
         or generate_random_path()

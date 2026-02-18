@@ -22,7 +22,7 @@
 ```bash
 # 下载脚本
 mkdir nano-xray && cd nano-xray
-curl -sLO https://s.qadmlee.com/deploy.py
+curl -sLO https://s.example.com/deploy.py
 
 # 服务器初始化（安装 Docker/BBR/UFW/fail2ban，生成 .env）
 python3 deploy.py prepare
@@ -41,7 +41,7 @@ python3 deploy.py add-proxy -d jp.example.com
 python3 deploy.py up
 ```
 
-> **更新脚本**: `curl -sLO https://s.qadmlee.com/deploy.py`
+> **更新脚本**: `curl -sLO https://s.example.com/deploy.py`
 
 ## 命令
 
@@ -108,7 +108,7 @@ CF_API_TOKEN=xxx              # 必填
 DEFAULT_UUID=                 # 可选，init 时自动生成
 DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
 DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
-REDIRECT_URL=                 # 可选，非 WS 路径重定向目标
+REDIRECT_URL=                 # 必填，非 WS 路径重定向目标
 
 # SSH 公钥（支持多个：SSH_KEY_1, SSH_KEY_2, ...）
 SSH_KEY_1=ssh-rsa AAAA... user1
@@ -145,15 +145,15 @@ crontab -e
 ### 日志格式
 
 ```
-2026-02-16 16:00 oregon | 1.10/180 GB | OK
-2026-02-16 17:00 oregon | 182.30/180 GB | BLOCKED
-2026-02-17 00:00 oregon | 0.05/180 GB | UNBLOCKED
+2026-02-16 16:00 oregon | 1.10/180 GiB | OK
+2026-02-16 17:00 oregon | 182.30/180 GiB | BLOCKED
+2026-02-17 00:00 oregon | 0.05/180 GiB | UNBLOCKED
 ```
 
 ### 工作原理
 
 1. 自动识别真实网卡（跳过 docker0/lo/veth），也可通过 `VNSTAT_IFACE` 指定
-2. 读取 vnstat 当月出站流量 (tx)，用 GB (10⁹) 计算（与云厂商计费一致）
+2. 读取 vnstat 当月出站流量 (tx)，用 GiB (2³⁰) 计算
 3. 流量 ≥ 阈值 → `ufw deny 443` 封端口 + Telegram 告警（带主机名）
 4. 流量 < 阈值且端口被封 → 自动解封 + Telegram 通知
 5. vnstat 不可用 → Telegram 告警
