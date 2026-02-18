@@ -14,7 +14,6 @@ import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -36,6 +35,7 @@ CF_API = "https://api.cloudflare.com/client/v4"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  终端颜色
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 class Color:
     RED = "\033[0;31m"
@@ -61,6 +61,7 @@ def error(msg: str) -> None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  .env 文件解析
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 def load_dotenv() -> dict[str, str]:
     """解析 .env 文件，返回键值对（不会覆盖已有环境变量）"""
@@ -97,6 +98,7 @@ def get_env(key: str, cli_value: str = "", dotenv: dict[str, str] | None = None)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  数据模型
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 @dataclass
 class Registry:
@@ -152,6 +154,7 @@ class Registry:
 #  工具函数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 def generate_uuid() -> str:
     return str(uuid.uuid4())
 
@@ -165,8 +168,12 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
     if not bot_token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = json.dumps({"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}).encode()
-    req = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    data = json.dumps(
+        {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    ).encode()
+    req = Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
     try:
         with urlopen(req, timeout=10) as resp:
             return resp.status == 200
@@ -179,7 +186,9 @@ def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | No
     try:
         result = subprocess.run(
             ["vnstat", "--json", "m"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode != 0:
             return None
@@ -218,8 +227,14 @@ def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | No
         else:
             tx_bytes = tx_val
 
-        return tx_bytes / (10 ** 9)
-    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, IndexError):
+        return tx_bytes / (10**9)
+    except (
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+    ):
         return None
 
 
@@ -281,6 +296,7 @@ def confirm_prompt(message: str) -> bool:
 #  Cloudflare API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 class CloudflareClient:
     def __init__(self, token: str):
         self.token = token
@@ -288,10 +304,15 @@ class CloudflareClient:
     def _request(self, method: str, endpoint: str, data: dict | None = None) -> dict:
         url = f"{CF_API}{endpoint}"
         body = json.dumps(data).encode() if data else None
-        req = Request(url, data=body, method=method, headers={
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        })
+        req = Request(
+            url,
+            data=body,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+        )
         try:
             with urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
@@ -311,7 +332,9 @@ class CloudflareClient:
         return zones[0]["id"] if zones else ""
 
     def create_or_update_dns(self, zone_id: str, domain: str, ip: str) -> bool:
-        result = self._request("GET", f"/zones/{zone_id}/dns_records?type=A&name={domain}")
+        result = self._request(
+            "GET", f"/zones/{zone_id}/dns_records?type=A&name={domain}"
+        )
         existing = result.get("result", [])
 
         record_data = {
@@ -324,7 +347,9 @@ class CloudflareClient:
 
         if existing:
             record_id = existing[0]["id"]
-            resp = self._request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", record_data)
+            resp = self._request(
+                "PUT", f"/zones/{zone_id}/dns_records/{record_id}", record_data
+            )
             if resp.get("success"):
                 info(f"已更新 DNS 记录: {domain} → {ip} (DNS only)")
                 return True
@@ -339,7 +364,9 @@ class CloudflareClient:
         return False
 
     def delete_dns(self, zone_id: str, domain: str) -> bool:
-        result = self._request("GET", f"/zones/{zone_id}/dns_records?type=A&name={domain}")
+        result = self._request(
+            "GET", f"/zones/{zone_id}/dns_records?type=A&name={domain}"
+        )
         records = result.get("result", [])
         if not records:
             warn(f"DNS 记录不存在: {domain}")
@@ -407,14 +434,23 @@ def auto_delete_dns(registry: Registry, domain: str) -> None:
 #  配置文件生成
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 class ConfigGenerator:
     def __init__(self, registry: Registry):
         self.reg = registry
 
     def generate_all(self) -> None:
-        if GENERATED_DIR.exists():
-            shutil.rmtree(GENERATED_DIR)
-        GENERATED_DIR.mkdir(parents=True)
+        # 不能 rmtree: Docker bind mount 绑定 inode，删除后重建的文件 inode 不同，
+        # 容器看不到更新。改为就地覆盖写入，保持 inode 不变。
+        GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 清理已不再需要的 xray 子目录（已删除的代理节点）
+        xray_dir = GENERATED_DIR / "xray"
+        if xray_dir.exists():
+            active_containers = {p["container_name"] for p in self.reg.proxies}
+            for child in xray_dir.iterdir():
+                if child.is_dir() and child.name not in active_containers:
+                    shutil.rmtree(child)
 
         self._generate_env()
         self._generate_caddyfile()
@@ -443,54 +479,60 @@ class ConfigGenerator:
                 container = svc["container_name"]
                 redirect = self.reg.redirect_url
 
-                lines.extend([
-                    f"{domain} {{",
-                    "\ttls {",
-                    "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
-                    "\t}",
-                    "",
-                    f"\thandle {vless_path} {{",
-                    f"\t\treverse_proxy {container}:{VLESS_WS_PORT}",
-                    "\t}",
-                    "",
-                    f"\thandle {vmess_path} {{",
-                    f"\t\treverse_proxy {container}:{VMESS_WS_PORT}",
-                    "\t}",
-                    "",
-                    "\thandle {",
-                    f"\t\tredir * {redirect} permanent",
-                    "\t}",
-                    "}",
-                ])
+                lines.extend(
+                    [
+                        f"{domain} {{",
+                        "\ttls {",
+                        "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                        "\t}",
+                        "",
+                        f"\thandle {vless_path} {{",
+                        f"\t\treverse_proxy {container}:{VLESS_WS_PORT}",
+                        "\t}",
+                        "",
+                        f"\thandle {vmess_path} {{",
+                        f"\t\treverse_proxy {container}:{VMESS_WS_PORT}",
+                        "\t}",
+                        "",
+                        "\thandle {",
+                        f"\t\tredir * {redirect} permanent",
+                        "\t}",
+                        "}",
+                    ]
+                )
 
             elif svc["type"] == "service":
                 target = svc["target"]
                 allowed_ips = svc.get("allowed_ips", [])
                 if allowed_ips:
                     ips_str = " ".join(allowed_ips)
-                    lines.extend([
-                        f"{domain} {{",
-                        "\ttls {",
-                        "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
-                        "\t}",
-                        "",
-                        f"\t@allowed remote_ip {ips_str}",
-                        "\thandle @allowed {",
-                        f"\t\treverse_proxy {target}",
-                        "\t}",
-                        "\trespond 403",
-                        "}",
-                    ])
+                    lines.extend(
+                        [
+                            f"{domain} {{",
+                            "\ttls {",
+                            "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                            "\t}",
+                            "",
+                            f"\t@allowed remote_ip {ips_str}",
+                            "\thandle @allowed {",
+                            f"\t\treverse_proxy {target}",
+                            "\t}",
+                            "\trespond 403",
+                            "}",
+                        ]
+                    )
                 else:
-                    lines.extend([
-                        f"{domain} {{",
-                        "\ttls {",
-                        "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
-                        "\t}",
-                        "",
-                        f"\treverse_proxy {target}",
-                        "}",
-                    ])
+                    lines.extend(
+                        [
+                            f"{domain} {{",
+                            "\ttls {",
+                            "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                            "\t}",
+                            "",
+                            f"\treverse_proxy {target}",
+                            "}",
+                        ]
+                    )
 
         (GENERATED_DIR / "Caddyfile").write_text("\n".join(lines) + "\n")
 
@@ -513,6 +555,19 @@ class ConfigGenerator:
             "      - caddy_config:/config",
         ]
 
+        # 如果有 service 使用 host.docker.internal，需要 extra_hosts 映射
+        needs_host_gateway = any(
+            "host.docker.internal" in s.get("target", "")
+            for s in self.reg.reverse_proxies
+        )
+        if needs_host_gateway:
+            lines.extend(
+                [
+                    "    extra_hosts:",
+                    '      - "host.docker.internal:host-gateway"',
+                ]
+            )
+
         proxies = self.reg.proxies
         if proxies:
             lines.append("    depends_on:")
@@ -521,19 +576,21 @@ class ConfigGenerator:
 
         for p in proxies:
             cn = p["container_name"]
-            lines.extend([
-                "",
-                f"  {cn}:",
-                "    image: ghcr.io/xtls/xray-core:26.2.6",
-                f"    container_name: {cn}",
-                "    restart: always",
-                '    command: ["run", "-config", "/etc/xray/config.json"]',
-                "    volumes:",
-                f"      - ./xray/{cn}/config.json:/etc/xray/config.json",
-                "    expose:",
-                f'      - "{VLESS_WS_PORT}"',
-                f'      - "{VMESS_WS_PORT}"',
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"  {cn}:",
+                    "    image: ghcr.io/xtls/xray-core:26.2.6",
+                    f"    container_name: {cn}",
+                    "    restart: always",
+                    '    command: ["run", "-config", "/etc/xray/config.json"]',
+                    "    volumes:",
+                    f"      - ./xray/{cn}/config.json:/etc/xray/config.json",
+                    "    expose:",
+                    f'      - "{VLESS_WS_PORT}"',
+                    f'      - "{VMESS_WS_PORT}"',
+                ]
+            )
 
         lines.extend(["", "volumes:", "  caddy_data:", "  caddy_config:"])
         (GENERATED_DIR / "docker-compose.yml").write_text("\n".join(lines) + "\n")
@@ -607,6 +664,7 @@ class ConfigGenerator:
 #  Docker 操作
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 def docker_compose(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["docker", "compose", *args],
@@ -623,6 +681,7 @@ def docker_exec(*args: str) -> subprocess.CompletedProcess[str]:
 #  CLI 命令
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 def cmd_init(args: argparse.Namespace) -> None:
     dotenv = load_dotenv()
 
@@ -634,9 +693,17 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     cf_token = get_env("CF_API_TOKEN", args.token, dotenv)
     default_uuid = get_env("DEFAULT_UUID", args.uuid, dotenv) or generate_uuid()
-    redirect_url = get_env("REDIRECT_URL", args.redirect, dotenv) or "https://www.qadmlee.com"
-    vless_path = get_env("DEFAULT_VLESS_WS_PATH", args.vless_ws_path, dotenv) or generate_random_path()
-    vmess_path = get_env("DEFAULT_VMESS_WS_PATH", args.vmess_ws_path, dotenv) or generate_random_path()
+    redirect_url = (
+        get_env("REDIRECT_URL", args.redirect, dotenv) or "https://www.qadmlee.com"
+    )
+    vless_path = (
+        get_env("DEFAULT_VLESS_WS_PATH", args.vless_ws_path, dotenv)
+        or generate_random_path()
+    )
+    vmess_path = (
+        get_env("DEFAULT_VMESS_WS_PATH", args.vmess_ws_path, dotenv)
+        or generate_random_path()
+    )
 
     # 检测公网 IP
     info("正在检测服务器公网 IP...")
@@ -673,7 +740,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         else:
             warn("API Token 验证失败，请检查权限")
     else:
-        warn("CF_API_TOKEN 未设置。请在 .env 文件中配置或运行: deploy.py init -t <token>")
+        warn(
+            "CF_API_TOKEN 未设置。请在 .env 文件中配置或运行: deploy.py init -t <token>"
+        )
 
 
 def cmd_add_proxy(args: argparse.Namespace) -> None:
@@ -739,12 +808,27 @@ def cmd_add_service(args: argparse.Namespace) -> None:
             info("已取消")
             return
 
-    allowed_ips = [ip.strip() for ip in args.allow_ips.split(",") if ip.strip()] if args.allow_ips else []
+    allowed_ips = (
+        [ip.strip() for ip in args.allow_ips.split(",") if ip.strip()]
+        if args.allow_ips
+        else []
+    )
+
+    # Docker 容器内 localhost 指向容器自身，自动转换为宿主机地址
+    target = args.target
+    if target.startswith(("localhost:", "127.0.0.1:")):
+        original = target
+        target = target.replace("localhost:", "host.docker.internal:", 1).replace(
+            "127.0.0.1:", "host.docker.internal:", 1
+        )
+        info(
+            f"已自动转换: {original} → {target} (Docker 容器内需通过 host.docker.internal 访问宿主机)"
+        )
 
     service = {
         "type": "service",
         "domain": args.domain,
-        "target": args.target,
+        "target": target,
         "allowed_ips": allowed_ips,
     }
     reg.add_service(service)
@@ -786,7 +870,9 @@ def cmd_list(args: argparse.Namespace) -> None:
         return
 
     print()
-    print(f"{Color.BOLD}{Color.CYAN}已注册的服务 (共 {len(reg.services)} 个):{Color.NC}")
+    print(
+        f"{Color.BOLD}{Color.CYAN}已注册的服务 (共 {len(reg.services)} 个):{Color.NC}"
+    )
     if reg.server_ip:
         print(f"  服务器 IP: {reg.server_ip}")
     print()
@@ -795,9 +881,13 @@ def cmd_list(args: argparse.Namespace) -> None:
     if proxies:
         print(f"  {Color.BOLD}▸ Xray 代理节点{Color.NC}")
         for p in proxies:
-            print(f"    {Color.GREEN}●{Color.NC} {p['domain']}  ({p['container_name']})")
+            print(
+                f"    {Color.GREEN}●{Color.NC} {p['domain']}  ({p['container_name']})"
+            )
             print(f"      UUID: {p['uuid']}")
-            print(f"      VLESS+WS: {p['vless_ws_path']}  |  VMess+WS: {p['vmess_ws_path']}")
+            print(
+                f"      VLESS+WS: {p['vless_ws_path']}  |  VMess+WS: {p['vmess_ws_path']}"
+            )
         print()
 
     services = reg.reverse_proxies
@@ -835,13 +925,19 @@ def cmd_reload(args: argparse.Namespace) -> None:
     try:
         running = subprocess.run(
             ["docker", "compose", "ps", "--format", "{{.Name}}"],
-            cwd=GENERATED_DIR, capture_output=True, text=True,
+            cwd=GENERATED_DIR,
+            capture_output=True,
+            text=True,
         )
         config = subprocess.run(
             ["docker", "compose", "config", "--services"],
-            cwd=GENERATED_DIR, capture_output=True, text=True,
+            cwd=GENERATED_DIR,
+            capture_output=True,
+            text=True,
         )
-        if set(running.stdout.strip().splitlines()) != set(config.stdout.strip().splitlines()):
+        if set(running.stdout.strip().splitlines()) != set(
+            config.stdout.strip().splitlines()
+        ):
             needs_restart = True
     except FileNotFoundError:
         needs_restart = True
@@ -902,7 +998,8 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
         if _has_ufw():
             result = subprocess.run(
                 ["ufw", "status"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             ports_blocked = "443/tcp" in result.stdout and "DENY" in result.stdout
         else:
@@ -972,7 +1069,9 @@ def cmd_update_ips(args: argparse.Namespace) -> None:
     if changed:
         svc["allowed_ips"] = current_ips
         reg.save()
-        info(f"当前白名单: {', '.join(current_ips) if current_ips else '无（允许所有）'}")
+        info(
+            f"当前白名单: {', '.join(current_ips) if current_ips else '无（允许所有）'}"
+        )
         warn("运行 'deploy.py reload' 使配置生效")
     elif not args.add and not args.remove:
         error("请指定 --add、--remove 或 --list")
@@ -983,6 +1082,7 @@ def cmd_update_ips(args: argparse.Namespace) -> None:
 #  CLI 入口
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deploy.py",
@@ -992,29 +1092,52 @@ def build_parser() -> argparse.ArgumentParser:
 
     # init
     p_init = sub.add_parser("init", help="初始化项目")
-    p_init.add_argument("-t", "--token", default="", help="Cloudflare API Token (也可在 .env 中配置)")
-    p_init.add_argument("-r", "--redirect", default="", help="默认重定向 URL (也可在 .env 中配置)")
-    p_init.add_argument("-u", "--uuid", default="", help="指定默认 UUID (也可在 .env 中配置)")
-    p_init.add_argument("--vless-ws-path", default="", help="指定 VLESS WS 路径 (也可在 .env 中配置)")
-    p_init.add_argument("--vmess-ws-path", default="", help="指定 VMess WS 路径 (也可在 .env 中配置)")
+    p_init.add_argument(
+        "-t", "--token", default="", help="Cloudflare API Token (也可在 .env 中配置)"
+    )
+    p_init.add_argument(
+        "-r", "--redirect", default="", help="默认重定向 URL (也可在 .env 中配置)"
+    )
+    p_init.add_argument(
+        "-u", "--uuid", default="", help="指定默认 UUID (也可在 .env 中配置)"
+    )
+    p_init.add_argument(
+        "--vless-ws-path", default="", help="指定 VLESS WS 路径 (也可在 .env 中配置)"
+    )
+    p_init.add_argument(
+        "--vmess-ws-path", default="", help="指定 VMess WS 路径 (也可在 .env 中配置)"
+    )
     p_init.set_defaults(func=cmd_init)
 
     # add-proxy
     p_proxy = sub.add_parser("add-proxy", help="添加 Xray 代理节点")
     p_proxy.add_argument("-d", "--domain", required=True, help="节点域名")
-    p_proxy.add_argument("-u", "--uuid", default="", help="UUID (默认: 使用 init 时设定的值)")
+    p_proxy.add_argument(
+        "-u", "--uuid", default="", help="UUID (默认: 使用 init 时设定的值)"
+    )
     p_proxy.add_argument("--new-uuid", action="store_true", help="强制生成新 UUID")
     p_proxy.add_argument("--no-dns", action="store_true", help="不自动创建 DNS 记录")
-    p_proxy.add_argument("-f", "--force", action="store_true", help="域名已存在时强制覆盖")
+    p_proxy.add_argument(
+        "-f", "--force", action="store_true", help="域名已存在时强制覆盖"
+    )
     p_proxy.set_defaults(func=cmd_add_proxy)
 
     # add-service
     p_svc = sub.add_parser("add-service", help="添加通用服务反代")
     p_svc.add_argument("-d", "--domain", required=True, help="服务域名")
-    p_svc.add_argument("-t", "--target", required=True, help="后端地址 (如 localhost:8317)")
+    p_svc.add_argument(
+        "-t",
+        "--target",
+        required=True,
+        help="后端地址 (如 localhost:8317，localhost 会自动转为 host.docker.internal)",
+    )
     p_svc.add_argument("--no-dns", action="store_true", help="不自动创建 DNS 记录")
-    p_svc.add_argument("-f", "--force", action="store_true", help="域名已存在时强制覆盖")
-    p_svc.add_argument("--allow-ips", default="", help="IP 白名单，逗号分隔 (如 1.2.3.0/24,5.6.7.8)")
+    p_svc.add_argument(
+        "-f", "--force", action="store_true", help="域名已存在时强制覆盖"
+    )
+    p_svc.add_argument(
+        "--allow-ips", default="", help="IP 白名单，逗号分隔 (如 1.2.3.0/24,5.6.7.8)"
+    )
     p_svc.set_defaults(func=cmd_add_service)
 
     # remove
@@ -1048,7 +1171,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ips.add_argument("-d", "--domain", required=True, help="服务域名")
     p_ips.add_argument("--add", default="", help="添加 IP，逗号分隔")
     p_ips.add_argument("--remove", default="", help="删除 IP，逗号分隔")
-    p_ips.add_argument("--list", dest="list_ips", action="store_true", help="列出当前白名单")
+    p_ips.add_argument(
+        "--list", dest="list_ips", action="store_true", help="列出当前白名单"
+    )
     p_ips.set_defaults(func=cmd_update_ips)
 
     return parser

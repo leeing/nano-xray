@@ -44,7 +44,7 @@ python3 deploy.py up
 |------|------|
 | `init` | 初始化 (自动检测 IP、生成默认 UUID 和路径) |
 | `add-proxy -d <域名>` | 添加代理节点 (自动创建 DNS) |
-| `add-service -d <域名> -t <目标>` | 添加服务反代 |
+| `add-service -d <域名> -t <目标>` | 添加服务反代 (localhost 自动转为 host.docker.internal) |
 | `remove -d <域名>` | 删除绑定 (自动删除 DNS) |
 | `list` | 列出所有服务 |
 | `up` | 生成配置 + 启动 Docker (首次) |
@@ -73,24 +73,25 @@ python3 deploy.py up
 | `--new-uuid` | add-proxy | 强制生成新 UUID |
 | `--allow-ips` | add-service | IP 白名单，逗号分隔 (如 `1.2.3.0/24,5.6.7.8`) |
 
-### IP 白名单示例
+### 服务反代示例
 
 ```bash
-# 初始设置白名单
+# 反代宿主机服务（localhost 会自动转为 host.docker.internal）
+python3 deploy.py add-service -d api.example.com -t localhost:8317
+
+# 也可以直接指定 host.docker.internal
+python3 deploy.py add-service -d api.example.com -t host.docker.internal:8317
+
+# 设置 IP 白名单
 python3 deploy.py add-service -d admin.example.com -t localhost:8080 --allow-ips 1.2.3.0/24,5.6.7.8
 
-# 追加 IP
+# 追加 / 删除 / 查看 IP
 python3 deploy.py update-ips -d admin.example.com --add 10.0.0.0/8
-
-# 删除 IP
 python3 deploy.py update-ips -d admin.example.com --remove 5.6.7.8
-
-# 查看当前白名单
 python3 deploy.py update-ips -d admin.example.com --list
-
-# 不限制 IP
-python3 deploy.py add-service -d api.example.com -t localhost:9090
 ```
+
+> **注意**: Caddy 运行在 Docker 容器内，`localhost` 指向容器自身而非宿主机。脚本会自动将 `localhost` / `127.0.0.1` 转为 `host.docker.internal`，并在 docker-compose.yml 中添加 `extra_hosts` 映射。
 
 ## .env 配置
 
