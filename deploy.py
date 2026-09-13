@@ -18,6 +18,1149 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import fcntl
+import hashlib
+import re
+import shlex
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Iterator, cast
+
+SCHEMA_VERSION = 1
+NODE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+LINK_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+
+
+class ValidationError(ValueError):
+    """Raised when desired topology data is inconsistent."""
+
+
+@dataclass(slots=True)
+class Node:
+    id: str
+    host: str
+    endpoint: str = ""
+    remote_dir: str = "/root/nano-xray"
+    domain: str = ""
+    network_profile: str = "bridge"
+    ssh_key: str = ""
+    imported_services: str = ""
+    service_ports: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.endpoint and self.host:
+            self.endpoint = self.host.rsplit("@", 1)[-1]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Node:
+        return cls(
+            id=str(data.get("id", "")),
+            host=str(data.get("host", "")),
+            endpoint=str(data.get("endpoint", "")),
+            remote_dir=str(data.get("remote_dir", "/root/nano-xray")),
+            domain=str(data.get("domain", "")),
+            network_profile=str(data.get("network_profile", "bridge")),
+            ssh_key=str(data.get("ssh_key", "")),
+            imported_services=str(data.get("imported_services", "")),
+            service_ports={
+                str(service_id): {
+                    "vless": int(ports["vless"]),
+                    "vmess": int(ports["vmess"]),
+                }
+                for service_id, ports in data.get("service_ports", {}).items()
+            },
+        )
+
+    def validate(self) -> None:
+        if not NODE_ID_RE.fullmatch(self.id):
+            raise ValidationError(f"非法 Node ID: {self.id}")
+        if not self.host or any(char.isspace() for char in self.host):
+            raise ValidationError(f"Node {self.id} 的 SSH host 无效")
+        if not self.endpoint or any(char.isspace() for char in self.endpoint):
+            raise ValidationError(f"Node {self.id} 的 WireGuard endpoint 无效")
+        if self.network_profile not in {"bridge", "host-l3"}:
+            raise ValidationError(f"Node {self.id} 的 network_profile 无效")
+        if not self.remote_dir.startswith("/"):
+            raise ValidationError(f"Node {self.id} 的 remote_dir 必须是绝对路径")
+        ports = [
+            port
+            for allocation in self.service_ports.values()
+            for port in allocation.values()
+        ]
+        if len(ports) != len(set(ports)) or any(
+            port < 1 or port > 65535 for port in ports
+        ):
+            raise ValidationError(f"Node {self.id} 的 Service 端口分配冲突")
+        if any(set(item) != {"vless", "vmess"} for item in self.service_ports.values()):
+            raise ValidationError(f"Node {self.id} 的 Service 端口字段无效")
+
+
+@dataclass(slots=True)
+class Allocation:
+    interface: str
+    subnet: str
+    source_address: str
+    target_address: str
+    listen_port: int
+    mark: int
+    route_table: int
+    rule_priority: int
+    client_uuid: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Allocation:
+        return cls(**data)
+
+    def validate(self) -> None:
+        network = ipaddress.ip_network(self.subnet)
+        if network.version != 4 or network.prefixlen != 30:
+            raise ValidationError(f"Link 子网必须是 IPv4 /30: {self.subnet}")
+        if ipaddress.ip_address(self.source_address) not in network:
+            raise ValidationError("source_address 不在 Link 子网中")
+        if ipaddress.ip_address(self.target_address) not in network:
+            raise ValidationError("target_address 不在 Link 子网中")
+        if self.source_address == self.target_address:
+            raise ValidationError("Link 两端地址不能相同")
+        if not (1 <= self.listen_port <= 65535):
+            raise ValidationError("WireGuard 端口超出范围")
+        uuid.UUID(self.client_uuid)
+
+
+@dataclass(slots=True)
+class Link:
+    id: str
+    source: str
+    target: str
+    entry_service: str
+    protocol: str = "both"
+    transport: str = "wg-l3"
+    enabled: bool = True
+    allocation: Allocation | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Link:
+        values = dict(data)
+        allocation = values.get("allocation")
+        values["allocation"] = Allocation.from_dict(allocation) if allocation else None
+        return cls(**values)
+
+    def validate(self) -> None:
+        if not LINK_ID_RE.fullmatch(self.id):
+            raise ValidationError(f"非法 Link ID: {self.id}")
+        if self.source == self.target:
+            raise ValidationError(f"Link {self.id} 不能连接同一 Node")
+        if self.protocol not in {"vmess", "vless", "both"}:
+            raise ValidationError(f"Link {self.id} 的 protocol 无效")
+        if self.transport != "wg-l3":
+            raise ValidationError(f"Link {self.id} 的 transport 无效")
+        if not self.entry_service:
+            raise ValidationError(f"Link {self.id} 缺少 entry_service")
+        if self.allocation is None:
+            raise ValidationError(f"Link {self.id} 尚未分配资源")
+        self.allocation.validate()
+
+
+@dataclass(slots=True)
+class LinkTombstone:
+    id: str
+    source: str
+    target: str
+    allocation: Allocation
+    removed_at: str
+
+    @classmethod
+    def from_link(cls, link: Link) -> LinkTombstone:
+        if link.allocation is None:
+            raise ValidationError(f"Link {link.id} 尚未分配资源")
+        return cls(
+            id=link.id,
+            source=link.source,
+            target=link.target,
+            allocation=link.allocation,
+            removed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LinkTombstone:
+        return cls(
+            id=str(data["id"]),
+            source=str(data["source"]),
+            target=str(data["target"]),
+            allocation=Allocation.from_dict(data["allocation"]),
+            removed_at=str(data["removed_at"]),
+        )
+
+    def validate(self) -> None:
+        if not LINK_ID_RE.fullmatch(self.id):
+            raise ValidationError(f"非法 tombstone Link ID: {self.id}")
+        if self.source == self.target:
+            raise ValidationError(f"tombstone {self.id} 两端不能相同")
+        self.allocation.validate()
+
+
+@dataclass(slots=True)
+class Topology:
+    schema_version: int = SCHEMA_VERSION
+    nodes: list[Node] = field(default_factory=list)
+    links: list[Link] = field(default_factory=list)
+    tombstones: list[LinkTombstone] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Topology:
+        version = data.get("schema_version", 0)
+        if version != SCHEMA_VERSION:
+            raise ValidationError(f"不支持的 topology schema_version: {version}")
+        return cls(
+            schema_version=version,
+            nodes=[Node.from_dict(item) for item in data.get("nodes", [])],
+            links=[Link.from_dict(item) for item in data.get("links", [])],
+            tombstones=[
+                LinkTombstone.from_dict(item) for item in data.get("tombstones", [])
+            ],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def node(self, node_id: str) -> Node | None:
+        return next((node for node in self.nodes if node.id == node_id), None)
+
+    def link(self, link_id: str) -> Link | None:
+        return next((link for link in self.links if link.id == link_id), None)
+
+    def validate(self) -> None:
+        node_ids = [node.id for node in self.nodes]
+        link_ids = [link.id for link in self.links]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValidationError("Node ID 重复")
+        if len(link_ids) != len(set(link_ids)):
+            raise ValidationError("Link ID 重复")
+        tombstone_ids = [item.id for item in self.tombstones]
+        if len(tombstone_ids) != len(set(tombstone_ids)):
+            raise ValidationError("tombstone Link ID 重复")
+        if set(link_ids) & set(tombstone_ids):
+            raise ValidationError("活动 Link ID 不能同时存在于 tombstone")
+        for node in self.nodes:
+            node.validate()
+        for link in self.links:
+            link.validate()
+            if link.source not in node_ids or link.target not in node_ids:
+                raise ValidationError(f"Link {link.id} 引用了不存在的 Node")
+            source = self.node(link.source)
+            target = self.node(link.target)
+            if (
+                source is None
+                or target is None
+                or source.network_profile != "host-l3"
+                or target.network_profile != "host-l3"
+            ):
+                raise ValidationError(f"Link {link.id} 两端必须使用 host-l3 profile")
+        for tombstone in self.tombstones:
+            tombstone.validate()
+            if tombstone.source not in node_ids or tombstone.target not in node_ids:
+                raise ValidationError(f"tombstone {tombstone.id} 引用了不存在的 Node")
+
+        allocations = [link.allocation for link in self.links if link.allocation]
+        for attribute in (
+            "interface",
+            "subnet",
+            "listen_port",
+            "mark",
+            "route_table",
+            "rule_priority",
+            "client_uuid",
+        ):
+            values = [getattr(allocation, attribute) for allocation in allocations]
+            if len(values) != len(set(values)):
+                raise ValidationError(f"Link 分配冲突: {attribute}")
+
+
+class TopologyStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock_path = path.with_suffix(path.suffix + ".lock")
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+
+    def load(self) -> Topology:
+        if not self.path.exists():
+            return Topology()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"无法读取拓扑文件 {self.path}: {exc}") from exc
+        topology = Topology.from_dict(data)
+        topology.validate()
+        return topology
+
+    def save(self, topology: Topology) -> None:
+        topology.validate()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        payload = json.dumps(topology.to_dict(), indent=2, ensure_ascii=False) + "\n"
+        temporary.write_text(payload, encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+
+
+BASE_NETWORK = ipaddress.IPv4Network("10.78.0.0/16")
+
+
+def allocate(topology: Topology) -> Allocation:
+    allocations = [link.allocation for link in topology.links if link.allocation]
+    allocations.extend(item.allocation for item in topology.tombstones)
+    used_interfaces = {item.interface for item in allocations}
+    used_subnets = {item.subnet for item in allocations}
+    used_ports = {item.listen_port for item in allocations}
+    used_marks = {item.mark for item in allocations}
+    used_tables = {item.route_table for item in allocations}
+    used_priorities = {item.rule_priority for item in allocations}
+
+    for index, network in enumerate(BASE_NETWORK.subnets(new_prefix=30), start=1):
+        interface = f"nx{index:04d}"
+        port = 52000 + index
+        mark = 10000 + index
+        table = 20000 + index
+        priority = 30000 + index
+        if (
+            interface in used_interfaces
+            or str(network) in used_subnets
+            or port in used_ports
+            or mark in used_marks
+            or table in used_tables
+            or priority in used_priorities
+        ):
+            continue
+        hosts = list(network.hosts())
+        return Allocation(
+            interface=interface,
+            subnet=str(network),
+            source_address=str(hosts[0]),
+            target_address=str(hosts[1]),
+            listen_port=port,
+            mark=mark,
+            route_table=table,
+            rule_priority=priority,
+            client_uuid=str(uuid.uuid4()),
+        )
+    raise ValidationError("10.78.0.0/16 Link 地址池已耗尽")
+
+
+def topology_hash(topology: Topology) -> str:
+    payload = json.dumps(topology.to_dict(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def build_plan(
+    topology: Topology, node_ids: list[str], link_ids: list[str]
+) -> dict[str, Any]:
+    selected_nodes = set(node_ids)
+    selected_links = set(link_ids)
+    explicitly_selected_nodes = set(node_ids)
+    for link in topology.links:
+        if link.id in selected_links or (
+            explicitly_selected_nodes
+            and {link.source, link.target} & explicitly_selected_nodes
+        ):
+            selected_nodes.update((link.source, link.target))
+            selected_links.add(link.id)
+    if not node_ids and not link_ids:
+        selected_nodes.update(node.id for node in topology.nodes)
+        selected_links.update(link.id for link in topology.links)
+    cleanup = []
+    for tombstone in topology.tombstones:
+        if (
+            (not node_ids and not link_ids)
+            or tombstone.id in selected_links
+            or bool({tombstone.source, tombstone.target} & explicitly_selected_nodes)
+        ):
+            selected_nodes.update((tombstone.source, tombstone.target))
+            selected_links.add(tombstone.id)
+            cleanup.append(
+                {
+                    "action": "cleanup-link",
+                    "link": tombstone.id,
+                    "nodes": [tombstone.source, tombstone.target],
+                    "interface": tombstone.allocation.interface,
+                    "route_table": tombstone.allocation.route_table,
+                    "mark": tombstone.allocation.mark,
+                }
+            )
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "topology_hash": topology_hash(topology),
+        "affected_nodes": sorted(selected_nodes),
+        "affected_links": sorted(selected_links),
+        "actions": cleanup
+        + [{"action": "render", "node": node_id} for node_id in sorted(selected_nodes)],
+        "apply_supported": False,
+        "apply_blocker": "远程 host-l3/WireGuard 发布尚未通过 Debian 集成测试",
+    }
+
+
+CADDY_IMAGE = "caddybuilds/caddy-cloudflare:latest"
+XRAY_IMAGE = "ghcr.io/xtls/xray-core:26.2.6"
+
+
+def _read_services(root: Path, node: Node) -> dict[str, Any]:
+    if not node.imported_services:
+        raise ValidationError(f"Node {node.id} 没有 Service 源配置")
+    path = root / node.imported_services
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"无法读取 Node {node.id} Service 配置: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("services"), list):
+        raise ValidationError(f"Node {node.id} Service 配置格式无效")
+    return data
+
+
+def _service_id(service: dict[str, Any]) -> str:
+    return str(service.get("container_name") or service.get("domain") or "")
+
+
+def _matches_entry(service: dict[str, Any], entry_service: str) -> bool:
+    domain = str(service.get("domain", ""))
+    container = str(service.get("container_name", ""))
+    candidates = {
+        domain,
+        domain.split(".", 1)[0],
+        container,
+        container.removeprefix("xray-"),
+    }
+    return entry_service in candidates
+
+
+def _links_for_service(
+    topology: Topology, node: Node, service: dict[str, Any]
+) -> list[Link]:
+    return [
+        link
+        for link in topology.links
+        if link.enabled
+        and link.source == node.id
+        and _matches_entry(service, link.entry_service)
+    ]
+
+
+def _render_xray(
+    service: dict[str, Any], ports: dict[str, int], links: list[Link]
+) -> dict[str, Any]:
+    vless_clients = [{"id": service["uuid"]}]
+    vmess_clients = [{"id": service["uuid"]}]
+    rules: list[dict[str, Any]] = [
+        {
+            "type": "field",
+            "protocol": ["bittorrent"],
+            "outboundTag": "blocked",
+        }
+    ]
+    outbounds: list[dict[str, Any]] = [
+        {"tag": "direct", "protocol": "freedom", "settings": {}},
+        {"tag": "blocked", "protocol": "blackhole", "settings": {}},
+    ]
+    for link in links:
+        allocation = link.allocation
+        if allocation is None:
+            raise ValidationError(f"Link {link.id} 尚未分配资源")
+        email = f"link.{link.id}"
+        client = {"id": allocation.client_uuid, "email": email}
+        inbound_tags = []
+        if link.protocol in {"vless", "both"}:
+            vless_clients.append(client)
+            inbound_tags.append("vless-in")
+        if link.protocol in {"vmess", "both"}:
+            vmess_clients.append(client)
+            inbound_tags.append("vmess-in")
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": inbound_tags,
+                "user": [email],
+                "outboundTag": email,
+            }
+        )
+        outbounds.append(
+            {
+                "tag": email,
+                "protocol": "freedom",
+                "sendThrough": allocation.source_address,
+                "settings": {},
+                "streamSettings": {"sockopt": {"mark": allocation.mark}},
+            }
+        )
+
+    def inbound(protocol: str, clients: list[dict[str, str]]) -> dict[str, Any]:
+        path_key = f"{protocol}_ws_path"
+        settings: dict[str, Any] = {"clients": clients}
+        if protocol == "vless":
+            settings["decryption"] = "none"
+        return {
+            "tag": f"{protocol}-in",
+            "listen": "127.0.0.1",
+            "port": ports[protocol],
+            "protocol": protocol,
+            "settings": settings,
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": service[path_key]},
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
+        }
+
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            inbound("vless", vless_clients),
+            inbound("vmess", vmess_clients),
+        ],
+        "routing": {"rules": rules},
+        "outbounds": outbounds,
+    }
+
+
+def _render_caddy(
+    data: dict[str, Any], node: Node, proxies: list[dict[str, Any]]
+) -> str:
+    proxy_by_id = {_service_id(service): service for service in proxies}
+    lines = ["{", "\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}", "}"]
+    for service in data["services"]:
+        domain = service["domain"]
+        lines.extend(
+            [
+                "",
+                f"{domain} {{",
+                "\ttls {",
+                "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                "\t}",
+            ]
+        )
+        if service.get("type") == "proxy":
+            service_id = _service_id(service)
+            if service_id not in proxy_by_id or service_id not in node.service_ports:
+                raise ValidationError(f"Service {service_id} 缺少端口分配")
+            ports = node.service_ports[service_id]
+            lines.extend(
+                [
+                    "",
+                    f"\thandle {service['vless_ws_path']} {{",
+                    f"\t\treverse_proxy 127.0.0.1:{ports['vless']}",
+                    "\t}",
+                    "",
+                    f"\thandle {service['vmess_ws_path']} {{",
+                    f"\t\treverse_proxy 127.0.0.1:{ports['vmess']}",
+                    "\t}",
+                    "",
+                    "\thandle {",
+                    f"\t\tredir * {data.get('redirect_url', 'https://www.example.com')} permanent",
+                    "\t}",
+                ]
+            )
+        elif service.get("type") == "service":
+            target = str(service["target"]).replace("host.docker.internal", "127.0.0.1")
+            allowed_ips = service.get("allowed_ips", [])
+            if allowed_ips:
+                lines.extend(
+                    [
+                        "",
+                        f"\t@allowed remote_ip {' '.join(allowed_ips)}",
+                        "\thandle @allowed {",
+                        f"\t\treverse_proxy {target}",
+                        "\t}",
+                        "\trespond 403",
+                    ]
+                )
+            else:
+                lines.extend(["", f"\treverse_proxy {target}"])
+        else:
+            raise ValidationError(f"Node {node.id} 存在未知 Service 类型")
+        lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _render_compose(proxies: list[dict[str, Any]], source_links: list[Link]) -> str:
+    lines = [
+        "services:",
+        "  caddy:",
+        f"    image: {CADDY_IMAGE}",
+        "    container_name: caddy",
+        "    restart: always",
+        "    network_mode: host",
+        "    environment:",
+        "      - CLOUDFLARE_API_TOKEN=${CF_API_TOKEN}",
+        "    volumes:",
+        "      - ./caddy:/etc/caddy:ro",
+        "      - caddy_data:/data",
+        "      - caddy_config:/config",
+    ]
+    if proxies:
+        lines.append("    depends_on:")
+        lines.extend(f"      - {_service_id(service)}" for service in proxies)
+    services_with_links = {link.entry_service for link in source_links if link.enabled}
+    for service in proxies:
+        service_id = _service_id(service)
+        needs_mark = any(
+            _matches_entry(service, entry) for entry in services_with_links
+        )
+        lines.extend(
+            [
+                "",
+                f"  {service_id}:",
+                f"    image: {XRAY_IMAGE}",
+                f"    container_name: {service_id}",
+                "    restart: always",
+                "    network_mode: host",
+                '    command: ["run", "-config", "/etc/xray/config.json"]',
+            ]
+        )
+        if needs_mark:
+            lines.extend(["    cap_add:", "      - NET_ADMIN"])
+        lines.extend(
+            [
+                "    volumes:",
+                f"      - ./xray/{service_id}:/etc/xray:ro",
+            ]
+        )
+    lines.extend(["", "volumes:", "  caddy_data:", "  caddy_config:"])
+    return "\n".join(lines) + "\n"
+
+
+def _write_private(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def render_node(
+    root: Path, topology: Topology, node_id: str, destination: Path
+) -> dict[str, str]:
+    node = topology.node(node_id)
+    if node is None:
+        raise ValidationError(f"Node 不存在: {node_id}")
+    if node.network_profile != "host-l3":
+        raise ValidationError(f"Node {node.id} 尚未切换到 host-l3 profile")
+    data = _read_services(root, node)
+    proxies = [
+        service for service in data["services"] if service.get("type") == "proxy"
+    ]
+    source_links = [link for link in topology.links if link.source == node.id]
+    target_links = [link for link in topology.links if link.target == node.id]
+
+    def endpoint(link_node_id: str) -> str:
+        link_node = topology.node(link_node_id)
+        if link_node is None:
+            raise ValidationError(f"Node 不存在: {link_node_id}")
+        return link_node.endpoint
+
+    files: dict[Path, str] = {
+        Path(".env"): f"CF_API_TOKEN={data.get('cf_api_token', '')}\n",
+        Path("caddy/Caddyfile"): _render_caddy(data, node, proxies),
+        Path("docker-compose.yml"): _render_compose(proxies, source_links),
+    }
+    for service in proxies:
+        service_id = _service_id(service)
+        ports = node.service_ports.get(service_id)
+        if ports is None:
+            raise ValidationError(f"Service {service_id} 缺少端口分配")
+        config = _render_xray(
+            service, ports, _links_for_service(topology, node, service)
+        )
+        files[Path("xray") / service_id / "config.json"] = (
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+        )
+
+    outgoing_links: list[dict[str, Any]] = [
+        {
+            "id": link.id,
+            "target": link.target,
+            "target_endpoint": endpoint(link.target),
+            "enabled": link.enabled,
+            "allocation": asdict(link.allocation) if link.allocation else None,
+        }
+        for link in source_links
+    ]
+    incoming_links: list[dict[str, Any]] = []
+    for link in target_links:
+        allocation = asdict(link.allocation) if link.allocation else None
+        if allocation:
+            allocation.pop("client_uuid", None)
+        incoming_links.append(
+            {
+                "id": link.id,
+                "source": link.source,
+                "source_endpoint": endpoint(link.source),
+                "enabled": link.enabled,
+                "allocation": allocation,
+            }
+        )
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "node": node.id,
+        "network_profile": node.network_profile,
+        "outgoing_links": outgoing_links,
+        "incoming_links": incoming_links,
+    }
+    files[Path("node-manifest.json")] = (
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+    )
+
+    hashes: dict[str, str] = {}
+    for relative, content in files.items():
+        _write_private(destination / relative, content)
+        hashes[str(relative)] = hashlib.sha256(content.encode()).hexdigest()
+    return hashes
+
+
+def _store(root: Path) -> TopologyStore:
+    return TopologyStore(root / "inventory" / "topology.json")
+
+
+def _save_services(root: Path, node_id: str, payload: str) -> Path:
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"services.json 不是有效 JSON: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("services", []), list):
+        raise ValidationError("services.json 缺少 services 列表")
+    destination = root / "inventory" / "nodes" / node_id / "services.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.chmod(destination, 0o600)
+    return destination
+
+
+def _create_default_services(root: Path, node: Node) -> Path:
+    if not node.domain:
+        raise ValidationError("新增独立 Node 必须提供 --domain")
+    default_uuid = str(uuid.uuid4())
+    vless_path = f"/{secrets.token_hex(4)}"
+    vmess_path = f"/{secrets.token_hex(4)}"
+    payload = {
+        "schema_version": 1,
+        "cf_api_token": "",
+        "redirect_url": "https://www.example.com",
+        "server_ip": "",
+        "cf_zone_id": "",
+        "default_uuid": default_uuid,
+        "default_vless_ws_path": vless_path,
+        "default_vmess_ws_path": vmess_path,
+        "services": [
+            {
+                "type": "proxy",
+                "domain": node.domain,
+                "uuid": default_uuid,
+                "vless_ws_path": vless_path,
+                "vmess_ws_path": vmess_path,
+                "container_name": f"xray-{node.id}",
+            }
+        ],
+    }
+    return _save_services(root, node.id, json.dumps(payload))
+
+
+def _inventory_service_id(service: dict[str, Any]) -> str:
+    return str(service.get("container_name") or service.get("domain") or "")
+
+
+def _allocate_service_ports(node: Node, payload: str) -> None:
+    data = json.loads(payload)
+    proxies = [item for item in data.get("services", []) if item.get("type") == "proxy"]
+    next_port = 2001
+    used = {
+        port
+        for allocation in node.service_ports.values()
+        for port in allocation.values()
+    }
+    for service in proxies:
+        service_id = _inventory_service_id(service)
+        if not service_id:
+            raise ValidationError("proxy Service 缺少 container_name/domain")
+        if service_id in node.service_ports:
+            continue
+        while next_port in used or next_port + 1 in used:
+            next_port += 10
+        node.service_ports[service_id] = {
+            "vless": next_port,
+            "vmess": next_port + 1,
+        }
+        used.update((next_port, next_port + 1))
+
+
+def _entry_service_exists(root: Path, node: Node, entry_service: str) -> bool:
+    if not node.imported_services:
+        return False
+    data = json.loads((root / node.imported_services).read_text(encoding="utf-8"))
+    for service in data.get("services", []):
+        if service.get("type") != "proxy":
+            continue
+        domain = str(service.get("domain", ""))
+        container = str(service.get("container_name", ""))
+        if entry_service in {
+            domain,
+            domain.split(".", 1)[0],
+            container,
+            container.removeprefix("xray-"),
+        }:
+            return True
+    return False
+
+
+def _load_remote_services(host: str, remote_dir: str, ssh_key: str) -> str:
+    if host.startswith("-"):
+        raise ValidationError("SSH host 不能以 '-' 开头")
+    command = ["ssh", "-o", "BatchMode=yes"]
+    if ssh_key:
+        command.extend(("-i", ssh_key))
+    remote_path = f"{remote_dir.rstrip('/')}/services.json"
+    command.extend((host, f"cat -- {shlex.quote(remote_path)}"))
+    # Arguments are kept as a list; the remote path is shell-quoted and host keys
+    # are verified by OpenSSH's normal known_hosts policy.
+    result = subprocess.run(  # noqa: S603
+        command, capture_output=True, text=True, check=False
+    )
+    if result.returncode:
+        raise ValidationError(result.stderr.strip() or "SSH 读取失败")
+    return result.stdout
+
+
+def _node_from_args(args: argparse.Namespace) -> Node:
+    endpoint = args.endpoint or args.host.rsplit("@", 1)[-1]
+    return Node(
+        id=args.node_id,
+        host=args.host,
+        endpoint=endpoint,
+        remote_dir=args.remote_dir,
+        domain=args.domain,
+        network_profile=args.network_profile,
+        ssh_key=args.ssh_key,
+    )
+
+
+def cmd_node(args: argparse.Namespace) -> None:
+    root = Path(args.project_root)
+    store = _store(root)
+    if args.node_action == "list":
+        topology = store.load()
+        for node in topology.nodes:
+            incoming = sum(link.target == node.id for link in topology.links)
+            outgoing = sum(link.source == node.id for link in topology.links)
+            print(
+                f"{node.id}\t{node.host}\t{node.network_profile}"
+                f"\tout={outgoing}\tin={incoming}"
+            )
+        return
+
+    with store.locked():
+        topology = store.load()
+        if args.node_action in {"add", "import"}:
+            if topology.node(args.node_id):
+                raise ValidationError(f"Node 已存在: {args.node_id}")
+            node = _node_from_args(args)
+            node.validate()
+            if args.node_action == "import":
+                payload = (
+                    Path(args.services_file).read_text(encoding="utf-8")
+                    if args.services_file
+                    else _load_remote_services(args.host, args.remote_dir, args.ssh_key)
+                )
+                destination = _save_services(root, node.id, payload)
+                node.imported_services = str(destination.relative_to(root))
+            else:
+                destination = _create_default_services(root, node)
+                node.imported_services = str(destination.relative_to(root))
+                payload = destination.read_text(encoding="utf-8")
+            _allocate_service_ports(node, payload)
+            topology.nodes.append(node)
+            store.save(topology)
+            print(f"Node 已登记: {node.id}")
+            return
+
+        if args.node_action == "update":
+            current_node = topology.node(args.node_id)
+            if current_node is None:
+                raise ValidationError(f"Node 不存在: {args.node_id}")
+            if args.host:
+                current_node.host = args.host
+            if args.endpoint:
+                current_node.endpoint = args.endpoint
+            if args.domain is not None:
+                current_node.domain = args.domain
+            if args.remote_dir:
+                current_node.remote_dir = args.remote_dir
+            if args.network_profile:
+                current_node.network_profile = args.network_profile
+            if args.ssh_key is not None:
+                current_node.ssh_key = args.ssh_key
+            store.save(topology)
+            print(f"Node 已更新: {current_node.id}")
+            return
+
+        if args.node_action == "detach":
+            if topology.node(args.node_id) is None:
+                raise ValidationError(f"Node 不存在: {args.node_id}")
+            removed: list[Link] = []
+            kept: list[Link] = []
+            for link in topology.links:
+                matches = (
+                    (args.all_links and args.node_id in {link.source, link.target})
+                    or (args.outgoing and link.source == args.node_id)
+                    or (args.incoming and link.target == args.node_id)
+                )
+                (removed if matches else kept).append(link)
+            topology.links = kept
+            for link in removed:
+                if not any(item.id == link.id for item in topology.tombstones):
+                    topology.tombstones.append(LinkTombstone.from_link(link))
+            store.save(topology)
+            print(f"已从期望配置移除 {len(removed)} 条 Link")
+            return
+
+        if args.node_action == "remove":
+            if topology.node(args.node_id) is None:
+                raise ValidationError(f"Node 不存在: {args.node_id}")
+            links = [
+                link.id
+                for link in topology.links
+                if args.node_id in {link.source, link.target}
+            ]
+            if links:
+                raise ValidationError(
+                    "Node 仍有关联 Link，请先 detach: " + ", ".join(links)
+                )
+            pending = [
+                item.id
+                for item in topology.tombstones
+                if args.node_id in {item.source, item.target}
+            ]
+            if pending:
+                raise ValidationError(
+                    "Node 仍有待清理 Link，请先完成 apply: " + ", ".join(pending)
+                )
+            topology.nodes = [
+                node for node in topology.nodes if node.id != args.node_id
+            ]
+            store.save(topology)
+            print(f"Node 已从期望配置移除: {args.node_id}")
+
+
+def cmd_link(args: argparse.Namespace) -> None:
+    root = Path(args.project_root)
+    store = _store(root)
+    if args.link_action == "list":
+        topology = store.load()
+        for link in topology.links:
+            status = "enabled" if link.enabled else "disabled"
+            print(
+                f"{link.id}\t{link.source} -> {link.target}\t{link.protocol}\t{status}"
+            )
+        return
+
+    with store.locked():
+        topology = store.load()
+        if args.link_action == "add":
+            if topology.link(args.link_id) or any(
+                item.id == args.link_id for item in topology.tombstones
+            ):
+                raise ValidationError(f"Link ID 已存在或已被保留: {args.link_id}")
+            source = topology.node(args.source)
+            target = topology.node(args.target)
+            if source is None or target is None:
+                raise ValidationError("source/target Node 必须先登记")
+            if (
+                source.network_profile != "host-l3"
+                or target.network_profile != "host-l3"
+            ):
+                raise ValidationError("WG L3 Link 两端必须先切换为 host-l3 profile")
+            if not _entry_service_exists(root, source, args.entry_service):
+                raise ValidationError(
+                    f"Node {source.id} 不存在 proxy Service: {args.entry_service}"
+                )
+            link = Link(
+                id=args.link_id,
+                source=args.source,
+                target=args.target,
+                entry_service=args.entry_service,
+                protocol=args.protocol,
+                transport=args.transport,
+                allocation=allocate(topology),
+            )
+            link.validate()
+            topology.links.append(link)
+            store.save(topology)
+            print(f"Link 已登记: {link.id} ({link.source} -> {link.target})")
+            if link.allocation is None:
+                raise ValidationError(f"Link {link.id} 分配失败")
+            print(f"客户端 UUID: {link.allocation.client_uuid}")
+            return
+
+        current_link = topology.link(args.link_id)
+        if current_link is None:
+            raise ValidationError(f"Link 不存在: {args.link_id}")
+        if args.link_action == "remove":
+            topology.links = [
+                item for item in topology.links if item.id != current_link.id
+            ]
+            if not any(item.id == current_link.id for item in topology.tombstones):
+                topology.tombstones.append(LinkTombstone.from_link(current_link))
+        else:
+            current_link.enabled = args.link_action == "enable"
+        store.save(topology)
+        labels = {"enable": "启用", "disable": "禁用", "remove": "移除"}
+        print(f"Link 已{labels[args.link_action]}: {current_link.id}")
+
+
+def cmd_plan(args: argparse.Namespace) -> None:
+    root = Path(args.project_root)
+    topology = _store(root).load()
+    node_ids = [item for item in args.nodes.split(",") if item]
+    link_ids = [item for item in args.links.split(",") if item]
+    unknown_nodes = sorted(set(node_ids) - {node.id for node in topology.nodes})
+    known_links = {link.id for link in topology.links} | {
+        item.id for item in topology.tombstones
+    }
+    unknown_links = sorted(set(link_ids) - known_links)
+    if unknown_nodes or unknown_links:
+        raise ValidationError(
+            "未知资源: " + ", ".join([*unknown_nodes, *unknown_links])
+        )
+    plan = build_plan(topology, node_ids, link_ids)
+    staging = root / "state" / "staging" / plan["topology_hash"][:16]
+    artifacts: dict[str, Any] = {}
+    for node_id in plan["affected_nodes"]:
+        node = topology.node(node_id)
+        if node is None:
+            raise ValidationError(f"Node 不存在: {node_id}")
+        if node.network_profile == "host-l3":
+            artifacts[node_id] = {
+                "profile": "host-l3",
+                "directory": str(staging / node_id),
+                "files": render_node(root, topology, node_id, staging / node_id),
+            }
+        else:
+            artifacts[node_id] = {
+                "profile": "bridge",
+                "services_source": node.imported_services,
+                "status": "保留旧版单机生成流程",
+            }
+    plan["artifacts"] = artifacts
+    payload = json.dumps(plan, indent=2, ensure_ascii=False) + "\n"
+    if args.save:
+        destination = Path(args.save)
+        if not destination.is_absolute():
+            destination = root / destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(payload, encoding="utf-8")
+        os.chmod(destination, 0o600)
+        print(f"Plan 已保存: {destination}")
+    else:
+        print(payload, end="")
+
+
+def cmd_apply(args: argparse.Namespace) -> None:
+    root = Path(args.project_root)
+    plan_path = Path(args.plan)
+    if not plan_path.is_absolute():
+        plan_path = root / plan_path
+    try:
+        plan: dict[str, Any] = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"无法读取 Plan: {exc}") from exc
+    topology = _store(root).load()
+    if plan.get("topology_hash") != topology_hash(topology):
+        raise ValidationError("Plan 已过期：拓扑在生成 Plan 后发生了变化")
+    if not plan.get("apply_supported"):
+        raise ValidationError(str(plan.get("apply_blocker", "该 Plan 暂不支持 apply")))
+    raise ValidationError("Plan 缺少可执行动作")
+
+
+def add_topology_parsers(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser], root: Path
+) -> None:
+    def common_node(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("node_id")
+        parser.add_argument("--host", required=True)
+        parser.add_argument(
+            "--endpoint",
+            default="",
+            help="WireGuard 公网 IP/主机名（默认取 --host 的 @ 后部分）",
+        )
+        parser.add_argument("--remote-dir", default="/root/nano-xray")
+        parser.add_argument("--domain", default="")
+        parser.add_argument(
+            "--network-profile", choices=("bridge", "host-l3"), default="bridge"
+        )
+        parser.add_argument("--ssh-key", default="")
+
+    node = sub.add_parser("node", help="管理 v2 Node 期望配置")
+    node.set_defaults(project_root=str(root), func=cmd_node)
+    node_sub = node.add_subparsers(dest="node_action", required=True)
+    common_node(node_sub.add_parser("add", help="登记独立 Node"))
+    imported = node_sub.add_parser("import", help="导入现有 Node 的 services.json")
+    common_node(imported)
+    imported.add_argument(
+        "--services-file", default="", help="从本地文件导入，省略时通过 SSH 读取"
+    )
+    update = node_sub.add_parser("update", help="更新 Node")
+    update.add_argument("node_id")
+    update.add_argument("--host", default="")
+    update.add_argument("--endpoint", default="")
+    update.add_argument("--remote-dir", default="")
+    update.add_argument("--domain", default=None)
+    update.add_argument("--network-profile", choices=("bridge", "host-l3"), default="")
+    update.add_argument("--ssh-key", default=None)
+    node_sub.add_parser("list", help="列出 Node")
+    detach = node_sub.add_parser("detach", help="移除 Node 关联的 Link 期望配置")
+    detach.add_argument("node_id")
+    direction = detach.add_mutually_exclusive_group(required=True)
+    direction.add_argument("--incoming", action="store_true")
+    direction.add_argument("--outgoing", action="store_true")
+    direction.add_argument("--all-links", action="store_true")
+    remove = node_sub.add_parser("remove", help="删除无 Link 的 Node 期望配置")
+    remove.add_argument("node_id")
+
+    link = sub.add_parser("link", help="管理 v2 有向 Link 期望配置")
+    link.set_defaults(project_root=str(root), func=cmd_link)
+    link_sub = link.add_subparsers(dest="link_action", required=True)
+    add = link_sub.add_parser("add", help="登记 Link 并稳定分配资源")
+    add.add_argument("source")
+    add.add_argument("target")
+    add.add_argument("--id", dest="link_id", required=True)
+    add.add_argument("--entry-service", required=True)
+    add.add_argument("--protocol", choices=("vmess", "vless", "both"), default="both")
+    add.add_argument("--transport", choices=("wg-l3",), default="wg-l3")
+    for action in ("enable", "disable", "remove"):
+        action_parser = link_sub.add_parser(action)
+        action_parser.add_argument("link_id")
+    link_sub.add_parser("list")
+
+    plan = sub.add_parser("plan", help="生成 v2 变更计划，不修改远程节点")
+    plan.add_argument("--nodes", default="", help="逗号分隔的 Node ID")
+    plan.add_argument("--links", default="", help="逗号分隔的 Link ID")
+    plan.add_argument("--save", default="")
+    plan.set_defaults(func=cmd_plan, project_root=str(root))
+
+    apply_parser = sub.add_parser("apply", help="应用经过校验的 v2 Plan")
+    apply_parser.add_argument("--plan", required=True)
+    apply_parser.set_defaults(func=cmd_apply, project_root=str(root))
+
+
+def run_safely(func: Any, args: argparse.Namespace) -> None:
+    try:
+        func(args)
+    except (ValidationError, ValueError, OSError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  常量
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -165,7 +1308,7 @@ class Registry:
     default_uuid: str = ""
     default_vless_ws_path: str = ""
     default_vmess_ws_path: str = ""
-    services: list[dict] = field(default_factory=list)
+    services: list[dict[str, Any]] = field(default_factory=list)
 
     def save(self) -> None:
         SERVICES_FILE.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False))
@@ -178,19 +1321,19 @@ class Registry:
         data = json.loads(SERVICES_FILE.read_text())
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
-    def find_domain(self, domain: str) -> dict | None:
+    def find_domain(self, domain: str) -> dict[str, Any] | None:
         return next((s for s in self.services if s["domain"] == domain), None)
 
-    def add_service(self, service: dict) -> None:
+    def add_service(self, service: dict[str, Any]) -> None:
         self.services.append(service)
         self.save()
 
-    def replace_service(self, domain: str, service: dict) -> None:
+    def replace_service(self, domain: str, service: dict[str, Any]) -> None:
         self.services = [s for s in self.services if s["domain"] != domain]
         self.services.append(service)
         self.save()
 
-    def remove_service(self, domain: str) -> dict | None:
+    def remove_service(self, domain: str) -> dict[str, Any] | None:
         svc = self.find_domain(domain)
         if svc:
             self.services = [s for s in self.services if s["domain"] != domain]
@@ -198,11 +1341,11 @@ class Registry:
         return svc
 
     @property
-    def proxies(self) -> list[dict]:
+    def proxies(self) -> list[dict[str, Any]]:
         return [s for s in self.services if s.get("type") == "proxy"]
 
     @property
-    def reverse_proxies(self) -> list[dict]:
+    def reverse_proxies(self) -> list[dict[str, Any]]:
         return [s for s in self.services if s.get("type") == "service"]
 
 
@@ -232,7 +1375,7 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
     )
     try:
         with urlopen(req, timeout=10) as resp:
-            return resp.status == 200
+            return int(resp.status) == 200
     except (HTTPError, URLError, OSError):
         return False
 
@@ -253,18 +1396,28 @@ def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | No
             return None
         data = json.loads(result.stdout)
 
-        # 找到真实网卡（跳过 docker0, lo, veth*, br-* 等虚拟接口）
-        virtual_prefixes = ("docker", "lo", "veth", "br-", "virbr")
+        # 找到公网网卡（跳过容器、loopback 和 WireGuard 等虚拟接口）
+        virtual_prefixes = ("docker", "lo", "veth", "br-", "virbr", "wg", "nx")
         iface = None
         override = get_env("VNSTAT_IFACE", "", dotenv)
-        for itf in data.get("interfaces", []):
-            name = itf.get("name", "")
-            if override and name == override:
-                iface = itf
-                break
-            if not any(name.startswith(p) for p in virtual_prefixes):
-                iface = itf
-                break
+        interfaces = data.get("interfaces", [])
+        if override:
+            iface = next(
+                (itf for itf in interfaces if itf.get("name", "") == override),
+                None,
+            )
+        else:
+            iface = next(
+                (
+                    itf
+                    for itf in interfaces
+                    if not any(
+                        itf.get("name", "").startswith(prefix)
+                        for prefix in virtual_prefixes
+                    )
+                ),
+                None,
+            )
 
         if iface is None:
             return None
@@ -286,7 +1439,7 @@ def get_vnstat_monthly_tx_gb(dotenv: dict[str, str] | None = None) -> float | No
         else:
             tx_bytes = tx_val
 
-        return tx_bytes / 1_000_000_000  # GB
+        return float(tx_bytes) / 1_000_000_000  # GB
     except (
         FileNotFoundError,
         subprocess.TimeoutExpired,
@@ -302,18 +1455,100 @@ def _has_ufw() -> bool:
     return shutil.which("ufw") is not None
 
 
-def ufw_block_ports() -> None:
-    """封锁 80/443 端口。"""
+TRAFFIC_GUARD_TABLE = "nano_xray_traffic_guard"
+TRAFFIC_GUARD_RULESET = f"""\
+table inet {TRAFFIC_GUARD_TABLE} {{
+    chain input {{
+        type filter hook input priority -100; policy accept;
+        iifname "lo" accept
+        tcp dport 22 accept
+        ct state established tcp sport 22 accept
+        meta nfproto ipv6 icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert }} accept
+        counter drop
+    }}
+
+    chain output {{
+        type filter hook output priority -100; policy accept;
+        oifname "lo" accept
+        tcp dport 22 accept
+        ct state established tcp sport 22 accept
+        meta nfproto ipv6 icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert }} accept
+        counter drop
+    }}
+
+    chain forward {{
+        type filter hook forward priority -100; policy drop;
+    }}
+}}
+"""
+
+
+def _has_nft() -> bool:
+    """检查 nftables 命令是否可用。"""
+    return shutil.which("nft") is not None
+
+
+def traffic_guard_is_active() -> bool:
+    """检查 nano-xray 的全局流量锁是否已经加载。"""
+    if not _has_nft():
+        return False
+    result = subprocess.run(
+        ["nft", "list", "table", "inet", TRAFFIC_GUARD_TABLE],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def traffic_guard_enable() -> bool:
+    """除 SSH 和 loopback 外，阻断主机及转发流量。"""
+    if not _has_nft():
+        warn("未找到 nft 命令，无法启用紧急网络锁")
+        return False
+    if traffic_guard_is_active():
+        return True
+    result = subprocess.run(
+        ["nft", "-f", "-"],
+        input=TRAFFIC_GUARD_RULESET,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        warn(f"启用紧急网络锁失败: {result.stderr.strip() or 'nft 执行失败'}")
+    return result.returncode == 0
+
+
+def traffic_guard_disable() -> bool:
+    """删除 nano-xray 独占的流量锁，不触碰其他 nftables 表。"""
+    if not _has_nft() or not traffic_guard_is_active():
+        return True
+    result = subprocess.run(
+        ["nft", "delete", "table", "inet", TRAFFIC_GUARD_TABLE],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        warn(f"解除紧急网络锁失败: {result.stderr.strip() or 'nft 执行失败'}")
+    return result.returncode == 0
+
+
+def _remove_legacy_ufw_denies() -> None:
+    """清理旧版本 check-traffic 添加的 80/443 DENY 规则。"""
     if not _has_ufw():
         return
     for rule in ["deny 80/tcp", "deny 443/tcp", "deny 443/udp"]:
-        subprocess.run(["ufw", *rule.split()], capture_output=True)
+        subprocess.run(
+            ["ufw", "--force", "delete", *rule.split()],
+            capture_output=True,
+            text=True,
+        )
 
 
 def ufw_allow_ports() -> None:
-    """放行 80/443 端口。"""
+    """恢复 nano-xray 单机服务正常需要的 80/443 端口。"""
     if not _has_ufw():
         return
+    _remove_legacy_ufw_denies()
     for rule in ["allow 80/tcp", "allow 443/tcp", "allow 443/udp"]:
         subprocess.run(["ufw", *rule.split()], capture_output=True)
 
@@ -328,7 +1563,7 @@ def detect_public_ip() -> str:
         try:
             req = Request(url, headers={"User-Agent": "curl/7.0"})
             with urlopen(req, timeout=5) as resp:
-                ip = resp.read().decode().strip()
+                ip = str(resp.read().decode().strip())
                 parts = ip.split(".")
                 if len(parts) == 4 and all(p.isdigit() for p in parts):
                     return ip
@@ -377,7 +1612,9 @@ class CloudflareClient:
     def __init__(self, token: str):
         self.token = token
 
-    def _request(self, method: str, endpoint: str, data: dict | None = None) -> dict:
+    def _request(
+        self, method: str, endpoint: str, data: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         url = f"{CF_API}{endpoint}"
         body = json.dumps(data).encode() if data else None
         req = Request(
@@ -391,21 +1628,21 @@ class CloudflareClient:
         )
         try:
             with urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
+                return cast(dict[str, Any], json.loads(resp.read().decode()))
         except HTTPError as e:
-            return json.loads(e.read().decode())
+            return cast(dict[str, Any], json.loads(e.read().decode()))
         except URLError as e:
             error(f"Cloudflare API 请求失败: {e}")
             return {"success": False, "errors": [{"message": str(e)}]}
 
     def verify_token(self) -> bool:
         result = self._request("GET", "/user/tokens/verify")
-        return result.get("success", False)
+        return bool(result.get("success", False))
 
     def get_zone_id(self, root_domain: str) -> str:
         result = self._request("GET", f"/zones?name={root_domain}&status=active")
         zones = result.get("result", [])
-        return zones[0]["id"] if zones else ""
+        return str(zones[0]["id"]) if zones else ""
 
     def create_or_update_dns(
         self, zone_id: str, domain: str, ip: str, *, force: bool = False
@@ -765,11 +2002,12 @@ def docker_compose(*args: str) -> subprocess.CompletedProcess[str]:
         ["docker", "compose", *args],
         cwd=GENERATED_DIR,
         capture_output=False,
+        text=True,
     )
 
 
 def docker_exec(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["docker", "exec", *args], capture_output=False)
+    return subprocess.run(["docker", "exec", *args], capture_output=False, text=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -784,9 +2022,12 @@ def _ensure_env() -> None:
         sys.exit(1)
 
 
-def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     """封装 subprocess.run，统一错误处理。"""
-    return subprocess.run(cmd, **kwargs)  # noqa: S603
+    return cast(
+        subprocess.CompletedProcess[str],
+        subprocess.run(cmd, **kwargs),  # noqa: S603
+    )
 
 
 def cmd_prepare(args: argparse.Namespace) -> None:
@@ -817,6 +2058,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
             "htop",
             "sysstat",
             "vnstat",
+            "nftables",
         ]
     )
 
@@ -851,25 +2093,28 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     info("设置时区 Asia/Shanghai...")
     _run(["timedatectl", "set-timezone", "Asia/Shanghai"])
 
-    # ── 4. SSH 加固（sed 修改关键行，保留系统原始配置） ──
-    info("配置 sshd...")
-    _run(
-        [
-            "sed",
-            "-i",
-            "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/",
-            "/etc/ssh/sshd_config",
-        ]
-    )
-    _run(
-        [
-            "sed",
-            "-i",
-            "s/^[# ]*PasswordAuthentication.*/PasswordAuthentication yes/",
-            "/etc/ssh/sshd_config",
-        ]
-    )
-    _run(["systemctl", "restart", "sshd"])
+    # ── 4. SSH 策略 ──
+    if args.configure_ssh_password_auth:
+        warn("按显式参数启用 root 与密码 SSH 登录")
+        _run(
+            [
+                "sed",
+                "-i",
+                "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/",
+                "/etc/ssh/sshd_config",
+            ]
+        )
+        _run(
+            [
+                "sed",
+                "-i",
+                "s/^[# ]*PasswordAuthentication.*/PasswordAuthentication yes/",
+                "/etc/ssh/sshd_config",
+            ]
+        )
+        _run(["systemctl", "restart", "sshd"])
+    else:
+        info("保留现有 SSH 登录策略")
 
     # ── 5. Docker ──
     if shutil.which("docker"):
@@ -981,18 +2226,21 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     # ── 9. Crontab（流量监控） ──
     info("配置流量监控 crontab...")
     work_dir = Path.cwd().resolve()
-    cron_job = f"0 * * * * cd {work_dir} && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1"
+    cron_jobs = [
+        f"0 * * * * cd {work_dir} && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1",
+        f"@reboot cd {work_dir} && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1",
+    ]
 
     result = _run(["crontab", "-l"], capture_output=True, text=True)
     existing_cron = result.stdout or ""
 
-    if "check-traffic" in existing_cron:
-        info("  流量监控 crontab 已存在，跳过")
+    existing_lines = set(existing_cron.splitlines())
+    missing_jobs = [job for job in cron_jobs if job not in existing_lines]
+    if not missing_jobs:
+        info("  每小时和开机流量监控 crontab 已存在，跳过")
     else:
-        if existing_cron.strip():
-            new_cron = existing_cron.rstrip("\n") + "\n" + cron_job + "\n"
-        else:
-            new_cron = cron_job + "\n"
+        prefix = existing_cron.rstrip("\n")
+        new_cron = "\n".join([item for item in [prefix, *missing_jobs] if item]) + "\n"
         subprocess.run(
             ["crontab", "-"],
             input=new_cron,
@@ -1002,10 +2250,11 @@ def cmd_prepare(args: argparse.Namespace) -> None:
 
         # 验证
         verify = _run(["crontab", "-l"], capture_output=True, text=True)
-        if "check-traffic" in (verify.stdout or ""):
-            info("  已添加流量监控 crontab ✓")
+        verified_lines = set((verify.stdout or "").splitlines())
+        if all(job in verified_lines for job in cron_jobs):
+            info("  已添加每小时和开机流量监控 crontab ✓")
         else:
-            warn(f"  crontab 写入失败，请手动添加: {cron_job}")
+            warn("  crontab 写入失败，请手动添加每小时和 @reboot 检查")
 
     # ── 完成 ──
     print()
@@ -1278,7 +2527,9 @@ def cmd_up(args: argparse.Namespace) -> None:
         ConfigGenerator(reg).generate_all()
 
     if not (GENERATED_DIR / "docker-compose.yml").is_file():
-        error("generated/docker-compose.yml 不存在，请先运行: python3 deploy.py up --generate")
+        error(
+            "generated/docker-compose.yml 不存在，请先运行: python3 deploy.py up --generate"
+        )
         sys.exit(1)
 
     print()
@@ -1370,36 +2621,37 @@ def cmd_check_traffic(args: argparse.Namespace) -> None:
     usage = f"{tx_gb:.2f}/{limit_gb:.0f} GB"
 
     if tx_gb >= limit_gb:
-        ufw_block_ports()
-        print(f"{ts} {host} | {usage} | BLOCKED")
-        msg = (
-            f"🚨 *nano-xray 流量超限*\n"
-            f"主机: `{host}`\n"
-            f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
-            f"已自动封锁 80/443 端口"
-        )
-        send_telegram(bot_token, chat_id, msg)
-    else:
-        if _has_ufw():
-            result = subprocess.run(
-                ["ufw", "status"],
-                capture_output=True,
-                text=True,
+        was_active = traffic_guard_is_active()
+        if not was_active:
+            warning_msg = (
+                f"🚨 *nano-xray 流量超限*\n"
+                f"主机: `{host}`\n"
+                f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
+                "即将启用紧急网络锁，仅保留 TCP 22"
             )
-            ports_blocked = "443/tcp" in result.stdout and "DENY" in result.stdout
-        else:
-            ports_blocked = False
-        if ports_blocked:
+            # 锁定后 HTTPS 也会被阻断，因此必须在安装规则前发送通知。
+            send_telegram(bot_token, chat_id, warning_msg)
+        if not traffic_guard_enable():
+            print(f"{ts} {host} | {usage} | ERROR: traffic guard failed")
+            sys.exit(1)
+        print(f"{ts} {host} | {usage} | BLOCKED")
+    else:
+        if traffic_guard_is_active():
+            if not traffic_guard_disable():
+                print(f"{ts} {host} | {usage} | ERROR: traffic guard release failed")
+                sys.exit(1)
             ufw_allow_ports()
             print(f"{ts} {host} | {usage} | UNBLOCKED")
             msg = (
                 f"✅ *nano-xray 流量恢复*\n"
                 f"主机: `{host}`\n"
                 f"当月出站: `{tx_gb:.2f} GB` / `{limit_gb:.0f} GB`\n"
-                f"已自动解封 80/443 端口"
+                "已解除紧急网络锁并恢复 80/443 服务端口"
             )
             send_telegram(bot_token, chat_id, msg)
         else:
+            # 升级自旧版本后，即使当前没有 nftables 流量锁，也清理其遗留规则。
+            _remove_legacy_ufw_denies()
             print(f"{ts} {host} | {usage} | OK")
 
 
@@ -1484,6 +2736,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_prepare = sub.add_parser(
         "prepare", help="服务器初始化（安装 Docker/BBR/UFW/fail2ban 等）"
     )
+    p_prepare.add_argument(
+        "--configure-ssh-password-auth",
+        action="store_true",
+        help="显式启用 root 与密码 SSH 登录（默认保留系统现有策略）",
+    )
     p_prepare.set_defaults(func=cmd_prepare)
 
     # init
@@ -1553,7 +2810,9 @@ def build_parser() -> argparse.ArgumentParser:
     # up
     p_up = sub.add_parser("up", help="使用现有配置启动 Docker 服务（默认不生成配置）")
     p_up.add_argument(
-        "--generate", action="store_true", help="启动前重新生成配置（覆盖 generated 中的配置）"
+        "--generate",
+        action="store_true",
+        help="启动前重新生成配置（覆盖 generated 中的配置）",
     )
     p_up.set_defaults(func=cmd_up)
 
@@ -1562,7 +2821,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_reload.set_defaults(func=cmd_reload)
 
     # check-traffic
-    p_traffic = sub.add_parser("check-traffic", help="检查当月流量，超限自动封端口")
+    p_traffic = sub.add_parser(
+        "check-traffic", help="检查当月流量，超限后除 TCP 22 外锁定网络"
+    )
     p_traffic.set_defaults(func=cmd_check_traffic)
 
     # update-ips
@@ -1575,6 +2836,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ips.set_defaults(func=cmd_update_ips)
 
+    add_topology_parsers(sub, SCRIPT_DIR)
+
     return parser
 
 
@@ -1586,7 +2849,7 @@ def main() -> None:
         parser.print_help()
         return
 
-    args.func(args)
+    run_safely(args.func, args)
 
 
 if __name__ == "__main__":

@@ -24,8 +24,22 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install development tools
+        run: uv sync --locked
+
+      - name: Quality gates
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+
       - name: Syntax check
         run: python -m py_compile deploy.py
+
+      - name: Unit tests
+        run: uv run pytest tests/ -v
 
       - name: Smoke test — init
         run: |

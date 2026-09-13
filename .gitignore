@@ -1,5 +1,6 @@
 # 自动生成的部署文件
 generated/
+.DS_Store
 
 # 服务注册表（含敏感 token）
 services.json
@@ -7,7 +8,18 @@ services.json
 # 旧的 output 目录
 output/
 __pycache__/
+.pytest_cache/
+.venv/
 
 
 .env
 
+# v2 本地状态、计划与机密
+inventory/
+state/
+plans/
+secrets/
+backups/
+
+# md files
+0*.md
