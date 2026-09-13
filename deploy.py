@@ -1150,7 +1150,7 @@ def cmd_add_proxy(args: argparse.Namespace) -> None:
     if not args.no_dns:
         auto_create_dns(reg, args.domain, force=args.force)
 
-    warn("运行 'deploy.py up' 使配置生效")
+    warn("运行 'deploy.py up --generate' 使配置生效")
 
 
 def cmd_add_service(args: argparse.Namespace) -> None:
@@ -1272,17 +1272,31 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_up(args: argparse.Namespace) -> None:
-    _ensure_env()
-    reg = Registry.load()
-    ConfigGenerator(reg).generate_all()
+    if args.generate:
+        _ensure_env()
+        reg = Registry.load()
+        ConfigGenerator(reg).generate_all()
+
+    if not (GENERATED_DIR / "docker-compose.yml").is_file():
+        error("generated/docker-compose.yml 不存在，请先运行: python3 deploy.py up --generate")
+        sys.exit(1)
 
     print()
-    info("正在启动 Docker 服务...")
-    docker_compose("up", "-d")
+    info("正在启动 Docker 服务（使用现有配置）...")
+    try:
+        result = docker_compose("up", "-d")
+    except FileNotFoundError:
+        error("未找到 Docker，请先安装 Docker 并确保 docker 命令可用")
+        sys.exit(1)
+    if result.returncode:
+        error("Docker 服务启动失败")
+        sys.exit(result.returncode)
     print()
     info("所有服务已启动 ✓")
     print()
-    docker_compose("ps")
+    result = docker_compose("ps")
+    if result.returncode:
+        sys.exit(result.returncode)
 
 
 def cmd_reload(args: argparse.Namespace) -> None:
@@ -1537,7 +1551,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.set_defaults(func=cmd_generate)
 
     # up
-    p_up = sub.add_parser("up", help="生成配置并启动 Docker 服务")
+    p_up = sub.add_parser("up", help="使用现有配置启动 Docker 服务（默认不生成配置）")
+    p_up.add_argument(
+        "--generate", action="store_true", help="启动前重新生成配置（覆盖 generated 中的配置）"
+    )
     p_up.set_defaults(func=cmd_up)
 
     # reload

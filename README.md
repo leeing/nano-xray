@@ -37,8 +37,8 @@ python3 deploy.py init
 python3 deploy.py add-proxy -d uk.example.com
 python3 deploy.py add-proxy -d jp.example.com
 
-# 一键启动
-python3 deploy.py up
+# 首次生成配置并启动
+python3 deploy.py up --generate
 ```
 
 > **更新脚本**: `curl -sLO https://s.example.com/deploy.py`
@@ -53,11 +53,30 @@ python3 deploy.py up
 | `add-service -d <域名> -t <目标>` | 添加服务反代 (localhost 自动转为 host.docker.internal) |
 | `remove -d <域名>` | 删除绑定 (自动删除 DNS) |
 | `list` | 列出所有服务 |
-| `up` | 生成配置 + 启动 Docker (首次) |
+| `up` | 使用现有配置启动 Docker，不重新生成配置 |
+| `up --generate` | 重新生成配置并启动 Docker（首次部署或更新源配置后） |
 | `reload` | 生成配置 + 热加载 (日常) |
 | `generate` | 仅生成配置文件 |
 | `check-traffic` | 检查当月流量，超限自动封端口 |
 | `update-ips -d <域名>` | 管理服务 IP 白名单 |
+
+### 启动已有配置
+
+```bash
+# 使用 generated/ 中的现有配置启动，不覆盖手工修改
+python3 deploy.py up
+
+# 明确重新生成配置后启动（保留原 up 的行为）
+python3 deploy.py up --generate
+```
+
+普通 `up` 不读取 `services.json`，也不要求项目根目录存在 `.env`。
+如果 `generated/docker-compose.yml` 不存在，会报错退出，不会自动生成。
+首次部署或通过 `add-proxy` 等命令修改源配置后，使用 `up --generate`。
+
+`--generate` 会覆盖生成目录中的配置。`generate` 和 `reload` 的行为保持不变，
+仍会重新生成配置，因此仍可能覆盖手工修改。
+`up` 不保证运行中的 Xray 重新读取手工修改的配置；本次调整仅分离配置生成与启动。
 
 ### init 参数
 
