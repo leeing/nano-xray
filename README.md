@@ -91,30 +91,50 @@ python3 deploy.py prepare
 
 `prepare` 必须由 root 执行。它会安装基础工具、vnstat、nftables、Docker、UFW 和 fail2ban，应用 BBR/TCP 参数，放行 SSH/HTTP/HTTPS/HTTP3 端口，并添加每小时一次及开机时执行的流量检查 cron。已有 `.env` 不会被覆盖。
 
-默认情况下，`prepare` 保留现有 SSH root 登录和密码认证策略。只有确实需要兼容旧环境时才使用：
+`prepare` 只创建 `.env` 模板，不会在模板尚未填写时尝试安装公钥。root 公钥在后续 `init` 阶段读取和配置。
+
+`--configure-ssh-password-auth` 是独立的兼容选项：
 
 ```bash
 python3 deploy.py prepare --configure-ssh-password-auth
 ```
 
-该选项会启用 root 和密码 SSH 登录，使用前应确认服务器已有合适的访问控制。
+该选项会通过受管 drop-in 启用 root、密码和键盘交互认证，并在 reload 前完成配置校验。默认不使用该参数时，`prepare` 保留现有密码认证策略。
 
 ### 2. 配置 `.env`
 
-至少填写：
+至少填写 Cloudflare Token 和重定向地址，并建议同时填写一个管理公钥：
 
 ```dotenv
 CF_API_TOKEN=your-cloudflare-api-token
 REDIRECT_URL=https://www.example.com
+SSH_KEY_1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@mac
 ```
 
-### 3. 初始化服务注册表
+多个管理员可以继续增加：
+
+```dotenv
+SSH_KEY_2=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... admin2
+SSH_KEY_3=ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... emergency
+```
+
+### 3. 初始化服务注册表和 SSH 公钥
 
 ```bash
 python3 deploy.py init
 ```
 
-`init` 会检测公网 IPv4，生成或采用指定的 UUID 与 WebSocket 路径，写入 `services.json`，并验证 Cloudflare Token。如果 `services.json` 已存在，它会询问是否覆盖；已有生产节点不要随意重新初始化。
+`init` 会读取 `.env` 中严格命名为 `SSH_KEY_1`、`SSH_KEY_2` 等的公钥，将它们原子写入 `/root/.ssh/authorized_keys`，并把目录和文件权限分别设置为 `0700`、`0600`。随后创建 `/etc/ssh/sshd_config.d/00-nano-xray.conf`：
+
+```text
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PermitRootLogin prohibit-password
+```
+
+脚本会先运行 `sshd -t`，再用 `sshd -T` 核对最终生效值，成功后优先 reload `sshd.service`，并兼容回退到 `ssh.service`。校验或 reload 失败会恢复原 drop-in。未配置任何 `SSH_KEY_N` 时，`init` 不会改写现有 `authorized_keys` 或 sshd 策略。
+
+除 SSH 配置外，`init` 还会检测公网 IPv4，生成或采用指定的 UUID 与 WebSocket 路径，写入 `services.json`，并验证 Cloudflare Token。如果 `services.json` 已存在，`init` 会先完成幂等的 SSH 公钥检查，再询问是否覆盖服务注册表；选择不覆盖不会撤销已经完成的 SSH 修复。已有生产节点不要随意覆盖 `services.json`。
 
 也可以用命令行明确指定参数：
 
@@ -157,8 +177,8 @@ python3 deploy.py add-proxy -d hk.example.com --force
 
 | 命令 | 说明 |
 |------|------|
-| `prepare` | 服务器初始化 (安装 Docker/BBR/UFW/fail2ban，生成 .env；保留现有 SSH 策略) |
-| `init` | 初始化 (自动检测 IP、生成默认 UUID 和路径) |
+| `prepare` | 安装 Docker/UFW/fail2ban/nftables、创建 `.env`；可选配置密码认证策略 |
+| `init` | 从 `.env` 安装 root 公钥、验证 sshd，并初始化服务注册表 |
 | `add-proxy -d <域名>` | 添加代理节点 (自动创建 DNS) |
 | `add-service -d <域名> -t <目标>` | 添加服务反代 (localhost 自动转为 host.docker.internal) |
 | `remove -d <域名>` | 删除绑定 (自动删除 DNS) |
@@ -437,6 +457,12 @@ python3 deploy.py up --generate
 | `--new-uuid` | add-proxy | 强制生成新 UUID |
 | `--allow-ips` | add-service | IP 白名单，逗号分隔 (如 `1.2.3.0/24,5.6.7.8`) |
 
+### prepare 的 SSH 参数
+
+| 参数 | 说明 |
+|---|---|
+| `--configure-ssh-password-auth` | 显式启用 root 密码和键盘交互认证；默认保留现有密码认证策略 |
+
 ### 服务反代示例
 
 ```bash
@@ -480,6 +506,8 @@ TELEGRAM_CHAT_ID=             # 可选，告警通知
 ```
 
 优先级：**CLI 参数 > 环境变量 > `.env` 文件**
+
+正常顺序是先运行 `prepare` 创建模板，再编辑 `.env`，最后运行 `init`。`init` 会合并当前进程环境和 `.env` 中严格命名为 `SSH_KEY_1`、`SSH_KEY_2` 等的变量，并根据 key type 与 base64 key body 去重；同一个 key 仅评论不同不会重复添加。再次运行 `init` 时，已有 key 不会重复写入。
 
 `.env` 和 `services.json` 包含敏感信息，不要提交到公开仓库。项目的 `.gitignore` 已默认忽略它们。
 
@@ -679,6 +707,27 @@ ssh -o BatchMode=yes -i ~/.ssh/nano_xray_ed25519 \
 ```
 
 确认用户名、私钥权限、远程路径和 `known_hosts` 后再重新导入。
+
+### `prepare` 后公钥仍不能登录
+
+先检查文件和权限：
+
+```bash
+sudo ls -ld /root/.ssh
+sudo ls -l /root/.ssh/authorized_keys
+sudo cat /root/.ssh/authorized_keys
+```
+
+期望目录为 `0700`、文件为 `0600`。然后检查语法和最终生效值：
+
+```bash
+sudo sshd -t
+sudo sshd -T | grep -E '^(pubkeyauthentication|authorizedkeysfile|permitrootlogin|passwordauthentication) '
+sudo systemctl status sshd.service
+sudo journalctl -u sshd.service -n 100 --no-pager
+```
+
+默认公钥模式应看到 `pubkeyauthentication yes`、`.ssh/authorized_keys`，以及 `permitrootlogin without-password` 或 `prohibit-password`。脚本优先 reload `sshd.service`；系统只提供 `ssh.service` 时会自动回退。如果 `init` 提示没有 `SSH_KEY_*`，请编辑 `.env` 后重新执行 `init`。
 
 ### 创建 Link 时报 `必须先切换为 host-l3 profile`
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import ipaddress
 import json
 import os
@@ -1200,7 +1202,8 @@ REDIRECT_URL=
 # DEFAULT_VLESS_WS_PATH=
 # DEFAULT_VMESS_WS_PATH=
 
-# SSH 公钥（每行一个，支持多个: SSH_KEY_1, SSH_KEY_2, ...)
+# root SSH 登录公钥（支持多个: SSH_KEY_1, SSH_KEY_2, ...)
+# init 会写入 /root/.ssh/authorized_keys，并验证 sshd drop-in 后 reload。
 # SSH_KEY_1=ssh-rsa AAAA... user1
 # SSH_KEY_2=ssh-ed25519 AAAA... user2
 
@@ -2030,6 +2033,209 @@ def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     )
 
 
+SSHD_DROP_IN = Path("/etc/ssh/sshd_config.d/00-nano-xray.conf")
+ROOT_SSH_DIR = Path("/root/.ssh")
+SSH_KEY_TYPE_RE = re.compile(
+    r"^(?:sk-)?(?:ssh-[A-Za-z0-9@._+-]+|ecdsa-sha2-[A-Za-z0-9@._+-]+)$"
+)
+SSH_ENV_KEY_RE = re.compile(r"^SSH_KEY_[1-9][0-9]*$")
+
+
+def _ssh_key_identity(public_key: str) -> tuple[str, str]:
+    """返回 authorized_keys 行中的 key type 和 base64 key body。"""
+    fields = public_key.strip().split()
+    for index, key_type in enumerate(fields[:-1]):
+        if not SSH_KEY_TYPE_RE.fullmatch(key_type):
+            continue
+        body = fields[index + 1]
+        normalized_body = body.rstrip("=")
+        padded_body = normalized_body + "=" * (-len(normalized_body) % 4)
+        try:
+            decoded = base64.b64decode(padded_body.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, binascii.Error) as exc:
+            raise ValidationError("SSH 公钥的 base64 内容无效") from exc
+        if len(decoded) < 16:
+            raise ValidationError("SSH 公钥内容过短")
+        return key_type, normalized_body
+    raise ValidationError("SSH 公钥格式无效或类型不受支持")
+
+
+def _collect_ssh_public_keys(dotenv: dict[str, str]) -> list[str]:
+    """从 .env 和进程环境收集公钥，并按 key identity 去重。"""
+    merged = dict(dotenv)
+    merged.update(
+        {
+            key: value
+            for key, value in os.environ.items()
+            if SSH_ENV_KEY_RE.fullmatch(key)
+        }
+    )
+    candidates = [
+        value
+        for key, value in sorted(merged.items())
+        if SSH_ENV_KEY_RE.fullmatch(key) and value.strip()
+    ]
+
+    unique: dict[tuple[str, str], str] = {}
+    for candidate in candidates:
+        identity = _ssh_key_identity(candidate)
+        unique.setdefault(identity, candidate.strip())
+    return list(unique.values())
+
+
+def _install_authorized_keys(
+    public_keys: list[str], ssh_dir: Path = ROOT_SSH_DIR
+) -> int:
+    """把新 key 原子写入 authorized_keys，保留已有行和选项。"""
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(ssh_dir, 0o700)
+    if os.geteuid() == 0:
+        os.chown(ssh_dir, 0, 0)
+    authorized_keys = ssh_dir / "authorized_keys"
+    if not public_keys:
+        return 0
+    existing_lines = (
+        authorized_keys.read_text(encoding="utf-8").splitlines()
+        if authorized_keys.exists()
+        else []
+    )
+    identities: set[tuple[str, str]] = set()
+    for line in existing_lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        try:
+            identities.add(_ssh_key_identity(line))
+        except ValidationError:
+            # 保留用户已有的未知格式行，但不拿它做去重依据。
+            continue
+
+    added = 0
+    for public_key in public_keys:
+        identity = _ssh_key_identity(public_key)
+        if identity in identities:
+            continue
+        existing_lines.append(public_key.strip())
+        identities.add(identity)
+        added += 1
+
+    temporary = authorized_keys.with_name("authorized_keys.nano-xray.tmp")
+    temporary.write_text(
+        "\n".join(existing_lines).rstrip("\n") + "\n", encoding="utf-8"
+    )
+    os.chmod(temporary, 0o600)
+    if os.geteuid() == 0:
+        os.chown(temporary, 0, 0)
+    os.replace(temporary, authorized_keys)
+    return added
+
+
+def _sshd_binary() -> str:
+    binary = shutil.which("sshd")
+    if binary:
+        return binary
+    fallback = Path("/usr/sbin/sshd")
+    if fallback.is_file():
+        return str(fallback)
+    raise ValidationError("未找到 sshd；请先安装 openssh-server")
+
+
+def _reload_sshd() -> bool:
+    """优先使用 sshd.service，同时兼容使用 ssh.service 的系统。"""
+    for unit in ("sshd.service", "ssh.service"):
+        try:
+            result = _run(["systemctl", "reload", unit], capture_output=True, text=True)
+        except OSError:
+            return False
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _configure_sshd(*, allow_password_auth: bool, have_public_keys: bool) -> bool:
+    """写入受管 drop-in，验证成功后 reload；失败时恢复旧文件。"""
+    if not allow_password_auth and not have_public_keys:
+        return False
+    binary = _sshd_binary()
+    lines = [
+        "# Managed by nano-xray deploy.py",
+        "PubkeyAuthentication yes",
+        "AuthorizedKeysFile .ssh/authorized_keys",
+    ]
+    if allow_password_auth:
+        lines.extend(
+            [
+                "PermitRootLogin yes",
+                "PasswordAuthentication yes",
+                "KbdInteractiveAuthentication yes",
+            ]
+        )
+    else:
+        lines.append("PermitRootLogin prohibit-password")
+    content = "\n".join(lines) + "\n"
+
+    SSHD_DROP_IN.parent.mkdir(parents=True, exist_ok=True)
+    previous = (
+        SSHD_DROP_IN.read_text(encoding="utf-8") if SSHD_DROP_IN.exists() else None
+    )
+    temporary = SSHD_DROP_IN.with_suffix(".conf.nano-xray.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, SSHD_DROP_IN)
+
+    def restore_previous() -> None:
+        if previous is None:
+            SSHD_DROP_IN.unlink(missing_ok=True)
+        else:
+            SSHD_DROP_IN.write_text(previous, encoding="utf-8")
+            os.chmod(SSHD_DROP_IN, 0o600)
+
+    validation = _run([binary, "-t"], capture_output=True, text=True)
+    if validation.returncode != 0:
+        restore_previous()
+        raise ValidationError(
+            "sshd 配置校验失败，已恢复原配置: "
+            + (validation.stderr.strip() or "sshd -t 返回错误")
+        )
+
+    effective = _run(
+        [binary, "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"],
+        capture_output=True,
+        text=True,
+    )
+    settings = {
+        line.split(None, 1)[0]: line.split(None, 1)[1]
+        for line in effective.stdout.splitlines()
+        if len(line.split(None, 1)) == 2
+    }
+    root_login_values = (
+        {"yes"} if allow_password_auth else {"without-password", "prohibit-password"}
+    )
+    effective_valid = (
+        effective.returncode == 0
+        and settings.get("pubkeyauthentication") == "yes"
+        and ".ssh/authorized_keys" in settings.get("authorizedkeysfile", "").split()
+        and settings.get("permitrootlogin") in root_login_values
+        and (
+            not allow_password_auth
+            or (
+                settings.get("passwordauthentication") == "yes"
+                and settings.get("kbdinteractiveauthentication") == "yes"
+            )
+        )
+    )
+    if not effective_valid:
+        restore_previous()
+        raise ValidationError(
+            "sshd 有效配置未采用 nano-xray 设置；请检查 "
+            "/etc/ssh/sshd_config 的 Include 顺序"
+        )
+    if not _reload_sshd():
+        restore_previous()
+        _reload_sshd()
+        raise ValidationError("无法 reload sshd.service/ssh.service，已恢复原配置")
+    return True
+
+
 def cmd_prepare(args: argparse.Namespace) -> None:
     """服务器初始化（Python 化的 prepare.sh）。"""
     if os.geteuid() != 0:
@@ -2056,67 +2262,26 @@ def cmd_prepare(args: argparse.Namespace) -> None:
             "curl",
             "tmux",
             "htop",
+            "openssh-server",
             "sysstat",
             "vnstat",
             "nftables",
         ]
     )
 
-    # ── 2. SSH 公钥 ──
-    info("配置 SSH 公钥...")
-    ssh_dir = Path("/root/.ssh")
-    ssh_dir.mkdir(parents=True, exist_ok=True)
-    ssh_dir.chmod(0o700)
-
-    id_rsa = ssh_dir / "id_rsa"
-    if not id_rsa.exists():
-        _run(["ssh-keygen", "-t", "rsa", "-N", "", "-f", str(id_rsa)])
-        info("  生成服务器密钥对 ✓")
-
-    dotenv = load_dotenv()
-    ssh_keys = [v for k, v in sorted(dotenv.items()) if k.startswith("SSH_KEY_")]
-
-    if not ssh_keys:
-        warn("SSH_KEY_* 未在 .env 中配置，跳过公钥写入")
-    else:
-        auth_keys = ssh_dir / "authorized_keys"
-        existing_keys = auth_keys.read_text() if auth_keys.exists() else ""
-        for key in ssh_keys:
-            if key not in existing_keys:
-                with auth_keys.open("a") as f:
-                    f.write(key + "\n")
-                tag = key.split()[-1] if key.split() else "unknown"
-                info(f"  添加公钥: {tag}")
-        auth_keys.chmod(0o600)
-
-    # ── 3. 时区 ──
+    # ── 2. 时区 ──
     info("设置时区 Asia/Shanghai...")
     _run(["timedatectl", "set-timezone", "Asia/Shanghai"])
 
-    # ── 4. SSH 策略 ──
+    # ── 3. 可选 SSH 密码策略 ──
     if args.configure_ssh_password_auth:
         warn("按显式参数启用 root 与密码 SSH 登录")
-        _run(
-            [
-                "sed",
-                "-i",
-                "s/^[# ]*PermitRootLogin.*/PermitRootLogin yes/",
-                "/etc/ssh/sshd_config",
-            ]
-        )
-        _run(
-            [
-                "sed",
-                "-i",
-                "s/^[# ]*PasswordAuthentication.*/PasswordAuthentication yes/",
-                "/etc/ssh/sshd_config",
-            ]
-        )
-        _run(["systemctl", "restart", "sshd"])
+        _configure_sshd(allow_password_auth=True, have_public_keys=False)
+        info(f"  sshd 配置已验证并 reload：{SSHD_DROP_IN}")
     else:
-        info("保留现有 SSH 登录策略")
+        info("保留现有 SSH 密码认证策略；公钥将在 init 阶段配置")
 
-    # ── 5. Docker ──
+    # ── 4. Docker ──
     if shutil.which("docker"):
         info("Docker 已安装，跳过")
     else:
@@ -2187,7 +2352,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         )
         info("Docker 安装完成 ✓")
 
-    # ── 6. 网络调优（BBR + 代理优化） ──
+    # ── 5. 网络调优（BBR + 代理优化） ──
     info("配置网络参数...")
     sysctl_file = Path("/etc/sysctl.conf")
     sysctl_file.touch(exist_ok=True)
@@ -2198,7 +2363,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
                 f.write(param + "\n")
     _run(["sysctl", "-p"])
 
-    # ── 7. UFW 防火墙 ──
+    # ── 6. UFW 防火墙 ──
     info("配置 UFW...")
     _run(["apt", "install", "-y", "ufw"])
     _run(["ufw", "default", "deny", "incoming"])
@@ -2215,7 +2380,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     else:
         info("  UFW 已处于活跃状态，跳过启用")
 
-    # ── 8. fail2ban ──
+    # ── 7. fail2ban ──
     info("配置 fail2ban...")
     _run(["apt", "install", "-y", "fail2ban"])
     jail_dir = Path("/etc/fail2ban/jail.d")
@@ -2223,7 +2388,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     (jail_dir / "defaults-debian.conf").write_text(_FAIL2BAN_CONF)
     _run(["systemctl", "restart", "fail2ban"])
 
-    # ── 9. Crontab（流量监控） ──
+    # ── 8. Crontab（流量监控） ──
     info("配置流量监控 crontab...")
     work_dir = Path.cwd().resolve()
     cron_jobs = [
@@ -2284,17 +2449,44 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     info(f"  BBR: {(bbr_result.stdout or '').strip()}")
     info(f"  fail2ban: {(f2b_result.stdout or '').strip()}")
     print()
-    info("下一步: 编辑 .env 填入 CF_API_TOKEN，然后运行 python3 deploy.py init")
+    info(
+        "下一步: 编辑 .env 填入 CF_API_TOKEN、REDIRECT_URL 和 SSH_KEY_1，"
+        "然后运行 python3 deploy.py init"
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> None:
     _ensure_env()
     dotenv = load_dotenv()
+    ssh_keys = _collect_ssh_public_keys(dotenv)
+    if ssh_keys:
+        if os.geteuid() != 0:
+            raise ValidationError(
+                "init 检测到 SSH_KEY_*，配置 /root/.ssh 和 sshd 需要 root 权限"
+            )
+        info("正在配置 root SSH 公钥...")
+        added_keys = _install_authorized_keys(ssh_keys)
+        preserve_password_auth = (
+            SSHD_DROP_IN.exists()
+            and "PasswordAuthentication yes"
+            in SSHD_DROP_IN.read_text(encoding="utf-8").splitlines()
+        )
+        _configure_sshd(
+            allow_password_auth=preserve_password_auth,
+            have_public_keys=True,
+        )
+        info(
+            f"authorized_keys 已校验：新增 {added_keys} 个，"
+            f"已有 {len(ssh_keys) - added_keys} 个"
+        )
+        info(f"sshd 配置已验证并 reload：{SSHD_DROP_IN}")
+    else:
+        info(".env 未配置 SSH_KEY_*，保留现有 authorized_keys 和 sshd 策略")
 
     if SERVICES_FILE.exists():
         warn("services.json 已存在")
         if not confirm_prompt("覆盖?"):
-            info("已取消")
+            info("已保留 services.json；SSH 公钥检查已完成")
             return
 
     cf_token = get_env("CF_API_TOKEN", args.token, dotenv)
@@ -2739,7 +2931,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_prepare.add_argument(
         "--configure-ssh-password-auth",
         action="store_true",
-        help="显式启用 root 与密码 SSH 登录（默认保留系统现有策略）",
+        help="显式启用 root 与密码 SSH 登录（默认保留现有密码认证策略）",
     )
     p_prepare.set_defaults(func=cmd_prepare)
 

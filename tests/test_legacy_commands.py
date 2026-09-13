@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import deploy
 
 
 class LegacyCommandTests(unittest.TestCase):
+    @staticmethod
+    def _public_key(comment: str = "user@example") -> str:
+        body = base64.b64encode(b"a valid test public key payload").decode()
+        return f"ssh-ed25519 {body} {comment}"
+
     def test_up_without_generate_does_not_load_or_generate(self) -> None:
         compose = Mock(side_effect=[Mock(returncode=0), Mock(returncode=0)])
         with (
@@ -64,6 +73,198 @@ class LegacyCommandTests(unittest.TestCase):
         with patch.object(deploy.subprocess, "run", return_value=result):
             value = deploy.get_vnstat_monthly_tx_gb({})
         self.assertEqual(value, 2.0)
+
+    def test_collect_ssh_keys_merges_sources_and_deduplicates_identity(self) -> None:
+        key = self._public_key()
+        second_key = self._public_key("same-key-different-comment")
+        third_key = (
+            f"ssh-rsa {base64.b64encode(b'another valid key payload').decode()} cli"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            key_file = Path(directory) / "keys.pub"
+            key_file.write_text(f"# managed keys\n{third_key}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"SSH_KEY_2": key}, clear=True):
+                keys = deploy._collect_ssh_public_keys(
+                    {
+                        "SSH_KEY_1": second_key,
+                        "SSH_KEY_3": third_key,
+                        "SSH_KEY_FILE": str(key_file),
+                    }
+                )
+        self.assertEqual(keys, [second_key, third_key])
+
+    def test_install_authorized_keys_is_atomic_and_preserves_existing_lines(
+        self,
+    ) -> None:
+        existing = self._public_key("existing")
+        new_key = (
+            f"ssh-rsa {base64.b64encode(b'a different valid key payload').decode()} new"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ssh_dir = Path(directory) / ".ssh"
+            ssh_dir.mkdir()
+            authorized_keys = ssh_dir / "authorized_keys"
+            authorized_keys.write_text(f"# keep this comment\n{existing}\n")
+            with patch.object(deploy.os, "geteuid", return_value=501):
+                added = deploy._install_authorized_keys(
+                    [self._public_key("duplicate"), new_key], ssh_dir
+                )
+            content = authorized_keys.read_text(encoding="utf-8")
+            self.assertEqual(added, 1)
+            self.assertIn("# keep this comment", content)
+            self.assertIn(existing, content)
+            self.assertIn(new_key, content)
+            self.assertFalse((ssh_dir / "authorized_keys.nano-xray.tmp").exists())
+            self.assertEqual(authorized_keys.stat().st_mode & 0o777, 0o600)
+
+    def test_install_authorized_keys_does_not_rewrite_without_new_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ssh_dir = Path(directory) / ".ssh"
+            ssh_dir.mkdir()
+            authorized_keys = ssh_dir / "authorized_keys"
+            authorized_keys.write_text("custom existing content", encoding="utf-8")
+            os.chmod(authorized_keys, 0o640)
+            with patch.object(deploy.os, "geteuid", return_value=501):
+                added = deploy._install_authorized_keys([], ssh_dir)
+            self.assertEqual(added, 0)
+            self.assertEqual(
+                authorized_keys.read_text(encoding="utf-8"), "custom existing content"
+            )
+            self.assertEqual(authorized_keys.stat().st_mode & 0o777, 0o640)
+
+    def test_configure_sshd_validates_effective_settings_before_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            drop_in = Path(directory) / "00-nano-xray.conf"
+            validation = Mock(returncode=0, stdout="", stderr="")
+            effective = Mock(
+                returncode=0,
+                stdout=(
+                    "pubkeyauthentication yes\n"
+                    "authorizedkeysfile .ssh/authorized_keys\n"
+                    "permitrootlogin without-password\n"
+                    "passwordauthentication no\n"
+                ),
+                stderr="",
+            )
+            with (
+                patch.object(deploy, "SSHD_DROP_IN", drop_in),
+                patch.object(deploy, "_sshd_binary", return_value="/usr/sbin/sshd"),
+                patch.object(deploy, "_run", side_effect=[validation, effective]),
+                patch.object(deploy, "_reload_sshd", return_value=True) as reload_sshd,
+            ):
+                configured = deploy._configure_sshd(
+                    allow_password_auth=False, have_public_keys=True
+                )
+            self.assertTrue(configured)
+            self.assertIn("PubkeyAuthentication yes", drop_in.read_text())
+            self.assertIn("PermitRootLogin prohibit-password", drop_in.read_text())
+            reload_sshd.assert_called_once_with()
+
+    def test_configure_sshd_restores_previous_file_when_effective_config_differs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            drop_in = Path(directory) / "00-nano-xray.conf"
+            drop_in.write_text("# previous\n", encoding="utf-8")
+            validation = Mock(returncode=0, stdout="", stderr="")
+            ineffective = Mock(
+                returncode=0,
+                stdout=(
+                    "pubkeyauthentication no\n"
+                    "authorizedkeysfile .ssh/authorized_keys\n"
+                    "permitrootlogin no\n"
+                ),
+                stderr="",
+            )
+            with (
+                patch.object(deploy, "SSHD_DROP_IN", drop_in),
+                patch.object(deploy, "_sshd_binary", return_value="/usr/sbin/sshd"),
+                patch.object(deploy, "_run", side_effect=[validation, ineffective]),
+                patch.object(deploy, "_reload_sshd") as reload_sshd,
+                self.assertRaises(deploy.ValidationError),
+            ):
+                deploy._configure_sshd(allow_password_auth=False, have_public_keys=True)
+            self.assertEqual(drop_in.read_text(encoding="utf-8"), "# previous\n")
+            reload_sshd.assert_not_called()
+
+    def test_reload_sshd_prefers_sshd_service_and_falls_back(self) -> None:
+        failed = Mock(returncode=1)
+        succeeded = Mock(returncode=0)
+        with patch.object(deploy, "_run", side_effect=[failed, succeeded]) as run:
+            reloaded = deploy._reload_sshd()
+        self.assertTrue(reloaded)
+        self.assertEqual(
+            [item.args[0][:3] for item in run.call_args_list],
+            [
+                ["systemctl", "reload", "sshd.service"],
+                ["systemctl", "reload", "ssh.service"],
+            ],
+        )
+
+    def test_init_installs_env_public_keys_and_configures_sshd(self) -> None:
+        key = self._public_key()
+        args = argparse.Namespace(
+            token="",
+            redirect="https://www.example.com",
+            uuid="00000000-0000-4000-8000-000000000000",
+            vless_ws_path="/vless",
+            vmess_ws_path="/vmess",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(deploy, "_ensure_env"),
+                patch.object(deploy, "SERVICES_FILE", root / "services.json"),
+                patch.object(deploy, "SSHD_DROP_IN", root / "00-nano-xray.conf"),
+                patch.object(deploy, "load_dotenv", return_value={"SSH_KEY_1": key}),
+                patch.object(deploy.os, "geteuid", return_value=0),
+                patch.object(
+                    deploy, "_install_authorized_keys", return_value=1
+                ) as install,
+                patch.object(deploy, "_configure_sshd", return_value=True) as configure,
+                patch.object(deploy, "detect_public_ip", return_value=""),
+                patch.object(deploy.Registry, "save"),
+            ):
+                deploy.cmd_init(args)
+        install.assert_called_once_with([key])
+        configure.assert_called_once_with(
+            allow_password_auth=False,
+            have_public_keys=True,
+        )
+
+    def test_init_syncs_ssh_before_declining_services_overwrite(self) -> None:
+        key = self._public_key()
+        args = argparse.Namespace(
+            token="",
+            redirect="",
+            uuid="",
+            vless_ws_path="",
+            vmess_ws_path="",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            services = root / "services.json"
+            services.write_text("{}", encoding="utf-8")
+            with (
+                patch.object(deploy, "_ensure_env"),
+                patch.object(deploy, "SERVICES_FILE", services),
+                patch.object(deploy, "SSHD_DROP_IN", root / "00-nano-xray.conf"),
+                patch.object(deploy, "load_dotenv", return_value={"SSH_KEY_1": key}),
+                patch.object(deploy.os, "geteuid", return_value=0),
+                patch.object(
+                    deploy, "_install_authorized_keys", return_value=1
+                ) as install,
+                patch.object(deploy, "_configure_sshd", return_value=True) as configure,
+                patch.object(deploy, "confirm_prompt", return_value=False),
+                patch.object(deploy.Registry, "save") as save,
+            ):
+                deploy.cmd_init(args)
+        install.assert_called_once_with([key])
+        configure.assert_called_once_with(
+            allow_password_auth=False,
+            have_public_keys=True,
+        )
+        save.assert_not_called()
 
     def test_traffic_guard_only_keeps_ssh_and_loopback(self) -> None:
         ruleset = deploy.TRAFFIC_GUARD_RULESET
