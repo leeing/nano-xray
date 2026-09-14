@@ -27,61 +27,61 @@ class TopologyTests(unittest.TestCase):
             ]
         )
 
-    def test_allocation_is_stable_after_round_trip(self) -> None:
-        allocation = allocate(self.topology)
+    def test_client_uuid_is_stable_after_round_trip(self) -> None:
+        client_uuid = allocate(self.topology)
         self.topology.links.append(
-            Link("hk1-us1", "hk1", "us1", "sz", allocation=allocation)
+            Link("hk1-us1", "hk1", "us1", "sz", "xray-us1", client_uuid=client_uuid)
         )
         with tempfile.TemporaryDirectory() as directory:
             store = TopologyStore(Path(directory) / "inventory" / "topology.json")
             store.save(self.topology)
             loaded = store.load()
-        self.assertEqual(loaded.links[0].allocation, allocation)
+        self.assertEqual(loaded.links[0].client_uuid, client_uuid)
         self.assertEqual(topology_hash(loaded), topology_hash(self.topology))
 
     def test_next_link_does_not_reuse_resources(self) -> None:
         first = allocate(self.topology)
         self.topology.links.append(
-            Link("hk1-us1", "hk1", "us1", "sz", allocation=first)
+            Link("hk1-us1", "hk1", "us1", "sz", "xray-us1", client_uuid=first)
         )
         second = allocate(self.topology)
-        self.assertNotEqual(first.interface, second.interface)
-        self.assertNotEqual(first.subnet, second.subnet)
-        self.assertNotEqual(first.client_uuid, second.client_uuid)
+        self.assertNotEqual(first, second)
 
     def test_removed_link_resources_are_not_reused(self) -> None:
         first = allocate(self.topology)
-        link = Link("hk1-us1", "hk1", "us1", "sz", allocation=first)
+        link = Link("hk1-us1", "hk1", "us1", "sz", "xray-us1", client_uuid=first)
         self.topology.tombstones.append(LinkTombstone.from_link(link))
         second = allocate(self.topology)
-        self.assertNotEqual(first.interface, second.interface)
-        self.assertNotEqual(first.subnet, second.subnet)
-        self.assertNotEqual(first.client_uuid, second.client_uuid)
+        self.assertNotEqual(first, second)
 
-    def test_duplicate_allocation_is_rejected(self) -> None:
-        allocation = allocate(self.topology)
+    def test_duplicate_client_uuid_is_rejected(self) -> None:
+        client_uuid = allocate(self.topology)
         self.topology.links.extend(
             [
-                Link("hk1-us1", "hk1", "us1", "sz", allocation=allocation),
-                Link("hk1-us2", "hk1", "us1", "sz", allocation=allocation),
+                Link(
+                    "hk1-us1", "hk1", "us1", "sz", "xray-us1", client_uuid=client_uuid
+                ),
+                Link(
+                    "hk1-us2", "hk1", "us1", "sz", "xray-us1", client_uuid=client_uuid
+                ),
             ]
         )
-        with self.assertRaisesRegex(ValidationError, "分配冲突"):
+        with self.assertRaisesRegex(ValidationError, "client_uuid 冲突"):
             self.topology.validate()
 
-    def test_plan_expands_both_link_endpoints(self) -> None:
+    def test_plan_only_changes_link_source(self) -> None:
         self.topology.links.append(
             Link(
                 "hk1-us1",
                 "hk1",
                 "us1",
                 "sz",
-                allocation=allocate(self.topology),
+                "xray-us1",
+                client_uuid=allocate(self.topology),
             )
         )
         plan = build_plan(self.topology, [], ["hk1-us1"])
-        self.assertEqual(plan["affected_nodes"], ["hk1", "us1"])
-        self.assertFalse(plan["apply_supported"])
+        self.assertEqual(plan["affected_nodes"], ["hk1"])
 
     def test_plan_does_not_expand_transitively(self) -> None:
         self.topology.nodes.append(
@@ -93,7 +93,8 @@ class TopologyTests(unittest.TestCase):
                 "hk1",
                 "us1",
                 "sz",
-                allocation=allocate(self.topology),
+                "xray-us1",
+                client_uuid=allocate(self.topology),
             )
         )
         self.topology.links.append(
@@ -102,11 +103,12 @@ class TopologyTests(unittest.TestCase):
                 "us1",
                 "de1",
                 "us",
-                allocation=allocate(self.topology),
+                "xray-de1",
+                client_uuid=allocate(self.topology),
             )
         )
         plan = build_plan(self.topology, ["hk1"], [])
-        self.assertEqual(plan["affected_nodes"], ["hk1", "us1"])
+        self.assertEqual(plan["affected_nodes"], ["hk1"])
         self.assertEqual(plan["affected_links"], ["hk1-us1"])
 
     def test_unknown_schema_is_rejected(self) -> None:

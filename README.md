@@ -1,63 +1,67 @@
 # nano-xray
 
-零第三方 Python 运行依赖的 Caddy + Xray 部署脚本。全部生产运行代码都集成在一个 `deploy.py` 中，适合直接下载到 Debian 服务器运行。
+`nano-xray` 是一个零第三方 Python 运行依赖的 Caddy + Xray 部署脚本。全部生产运行代码都集成在单个 `deploy.py` 中，适合直接下载到 Debian 服务器部署。
 
-项目提供两组能力：
+当前代码提供两组能力：
 
-- **单机部署**：在一台服务器上管理多个 VLESS/VMess 代理域名和普通 HTTPS 反向代理。这部分可以直接用于服务器部署。
-- **Node + Link 控制面**：在管理机上登记多台 VPS、导入已有服务、创建有向 Link，并生成 host-l3 节点配置和部署计划。当前只生成和校验计划，不会修改远程节点网络。
+- **单机服务管理**：在一台服务器上管理多个 VLESS/VMess 代理域名和普通 HTTPS 反向代理。
+- **本机 Xray Link**：把当前服务器作为 source，只导入目标节点的 `services.json`，再为本机增加一条经目标节点出站的代理链路。
 
-Node 是完整且可独立使用的 VPS；Link 是额外、显式的有向中转关系。创建 `hk1 → us1` 不会取消 HK1 或 US1 的独立代理，也不会自动创建反向 Link 或隐式三跳。
+现在的 Link 流程不使用 SSH 连接目标节点，也不远程发布配置。以 TW → JP 为例，只需在 TW 上导入一份手工复制来的 JP `services.json`，然后执行：
 
-## 目录
+```bash
+python3 deploy.py node import jp --services-file ./imports/jp-services.json
+python3 deploy.py link add jp
+python3 deploy.py apply --link tw-jp
+```
 
-- [特性](#特性)
-- [运行要求](#运行要求)
-- [单文件下载安装](#单文件下载安装)
-- [单机首次部署](#单机首次部署)
-- [日常单机管理](#日常单机管理)
-- [普通服务反代](#服务反代示例)
-- [客户端配置参数](#客户端配置参数)
-- [流量监控](#流量监控)
-- [Node + Link 使用流程](#v2-node--link-基础功能)
-- [当前实现边界](#当前实现边界)
-- [文件与数据目录](#文件结构)
-- [常见问题](#常见问题)
-- [开发验证](#开发验证)
+本机 Node 名、Link ID 和入口 Service 都由脚本推导，无需重复填写：
 
-## 特性
+```text
+tw.qadmlee.com  → 本机 Node tw
+tw + jp         → Link ID tw-jp
+本机 Node tw    → entry_service xray-tw
+```
 
-- **双协议**: VLESS+WS+TLS 和 VMess+WS+TLS 同时支持
-- **默认共享配置**: 单机模式新增代理默认共用初始化时的 UUID 和路径，也可为某个代理单独指定
-- **自动 TLS**: Caddy + Cloudflare DNS-01 自动申请和续期证书
-- **自动 DNS**: 添加/删除节点时自动操作 Cloudflare DNS 记录
-- **按需更新**: 容器集合不变时，`reload` 热加载 Caddy；容器变化时自动执行 Compose 更新
-- **单文件交付**: 远程服务器只需下载 `deploy.py`，无需安装本项目或 Python package
-- **零 Python 依赖**: 只使用 Python 标准库；运行容器服务时需要 Docker
-- **拓扑控制面**: 支持版本化 Node/Link、稳定资源分配、tombstone 和可审查 Plan
+创建 Link 只修改 TW 本机的 Xray 配置。JP 继续作为独立代理运行，不需要增加配置或重启；删除 Link 也不会删除 TW、JP 或其他 Link。
+
+## 功能概览
+
+- VLESS + WebSocket + TLS 与 VMess + WebSocket + TLS。
+- Caddy 使用 Cloudflare DNS-01 自动签发和续期证书。
+- 添加和删除服务时可自动管理 Cloudflare DNS A 记录。
+- 一台服务器可运行多个代理域名和多个普通反向代理。
+- 普通反向代理支持来源 IP 白名单。
+- `prepare` 安装 Docker、UFW、fail2ban、vnstat、nftables，并启用 BBR 等系统参数。
+- `init` 从 `.env` 安装 root SSH 公钥，并校验 sshd 的最终生效配置。
+- 月出站流量超限时，使用 nftables 阻断除 TCP 22 外的所有主机入站、主机出站和转发流量。
+- Link 使用目标节点已有的 VLESS/VMess + WebSocket + TLS 服务，不依赖 WireGuard。
+- Link 应用前使用固定版本 Xray 镜像校验配置；应用时备份、原子替换并重建对应容器；失败自动回滚。
+- 所有运行代码只需一个 `deploy.py`，无需安装本项目或 Python package。
 
 ## 运行要求
 
-### 单机部署
+### 服务器部署
 
-1. Debian 12 或相近 Debian 环境。
+1. Debian 12 或相近的 Debian 环境。
 2. Python 3.11 或更高版本。
-3. root 权限；`prepare` 会安装并配置系统组件。
-4. 域名 DNS 托管在 Cloudflare。
-5. Cloudflare API Token，权限至少为 `Zone DNS: Edit` 和 `Zone: Zone: Read`。
+3. root 权限；`prepare` 需要安装和配置系统组件。
+4. 使用自动 DNS 和自动 TLS 时，域名 DNS 托管在 Cloudflare。
+5. Cloudflare API Token 至少具有 `Zone DNS: Edit` 和 `Zone: Zone: Read` 权限。
 6. 公网 TCP 80、TCP 443 和 UDP 443 可达。
 
 Docker 无需预装，`prepare` 会安装 Docker Engine 和 Compose 插件。
 
-### Node + Link 管理
+### Link 管理
 
-1. 管理机安装 Python 3.11 或更高版本。
-2. 通过 SSH 导入节点时，需要 OpenSSH 客户端和已经核对的 SSH host key。
-3. 仅执行 `node add`、本地文件导入、`link` 和 `plan` 时不需要 root。
+- `node import` 只读取本机文件，不需要 SSH。
+- `node import`、`node list`、`link add`、`link list` 和 `plan` 不需要 root。
+- `apply` 必须在 Link 的 source 服务器执行，且当前用户必须能够操作 Docker。以正常的 root 部署方式运行即可满足要求。
+- target 必须已经运行一个可从 source 访问的 VLESS 或 VMess WebSocket + TLS 服务。
 
 ## 单文件下载安装
 
-`deploy.py` 所在目录就是运行目录，后续的 `.env`、`services.json`、`generated/`、`inventory/` 和 `state/` 都会创建在这里。不要从临时目录运行。
+`deploy.py` 所在目录就是项目运行目录。`.env`、`services.json`、`generated/`、`inventory/` 和 `state/` 都会在这里创建，因此不要从临时目录运行。
 
 ```bash
 sudo mkdir -p /root/nano-xray
@@ -68,7 +72,7 @@ sudo chmod 0755 deploy.py
 python3 deploy.py --help
 ```
 
-把示例 URL 替换为实际发布地址。更新时只需备份并覆盖这个文件：
+把示例 URL 替换为实际发布地址。更新程序时可以先备份再覆盖单文件：
 
 ```bash
 cd /root/nano-xray
@@ -85,38 +89,65 @@ python3 deploy.py --help
 ### 1. 初始化服务器
 
 ```bash
-# 服务器初始化（安装 Docker/BBR/UFW/fail2ban，生成 .env）
+cd /root/nano-xray
 python3 deploy.py prepare
 ```
 
-`prepare` 必须由 root 执行。它会安装基础工具、vnstat、nftables、Docker、UFW 和 fail2ban，应用 BBR/TCP 参数，放行 SSH/HTTP/HTTPS/HTTP3 端口，并添加每小时一次及开机时执行的流量检查 cron。已有 `.env` 不会被覆盖。
+`prepare` 必须由 root 执行。它会：
 
-`prepare` 只创建 `.env` 模板，不会在模板尚未填写时尝试安装公钥。root 公钥在后续 `init` 阶段读取和配置。
+1. 创建 `.env` 模板；已有文件不会覆盖。
+2. 安装基础工具、OpenSSH Server、vnstat 和 nftables。
+3. 设置 `Asia/Shanghai` 时区。
+4. 安装 Docker Engine 和 Compose 插件。
+5. 应用 BBR/TCP 参数。
+6. 配置 UFW，放行 TCP 22、TCP 80、TCP 443 和 UDP 443。
+7. 安装并配置 fail2ban。
+8. 添加每小时一次和开机时运行的 `check-traffic` cron。
 
-`--configure-ssh-password-auth` 是独立的兼容选项：
+`prepare` 只创建 `.env` 模板，此时模板还没有公钥内容，所以不会安装 SSH 公钥。公钥由后续 `init` 从填写后的 `.env` 读取。
+
+默认情况下，`prepare` 保留系统现有的 SSH 密码认证策略。如果明确需要启用 root 密码及键盘交互认证，可执行：
 
 ```bash
 python3 deploy.py prepare --configure-ssh-password-auth
 ```
 
-该选项会通过受管 drop-in 启用 root、密码和键盘交互认证，并在 reload 前完成配置校验。默认不使用该参数时，`prepare` 保留现有密码认证策略。
+脚本会写入受管 sshd drop-in，在 reload 前完成语法与有效配置校验。
 
-### 2. 配置 `.env`
+### 2. 编辑 `.env`
 
-至少填写 Cloudflare Token 和重定向地址，并建议同时填写一个管理公钥：
+```bash
+nano .env
+```
+
+至少填写 Cloudflare Token 和默认重定向地址。建议同时填写一个管理公钥：
 
 ```dotenv
 CF_API_TOKEN=your-cloudflare-api-token
 REDIRECT_URL=https://www.example.com
+
 SSH_KEY_1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@mac
+
+# 可选；留空时 init 自动生成
+# DEFAULT_UUID=
+# DEFAULT_VLESS_WS_PATH=
+# DEFAULT_VMESS_WS_PATH=
+
+# 可选的月出站流量保护
+TRAFFIC_LIMIT_GB=180
+# VNSTAT_IFACE=ens4
+# TELEGRAM_BOT_TOKEN=
+# TELEGRAM_CHAT_ID=
 ```
 
-多个管理员可以继续增加：
+多个管理员可以继续增加严格编号的变量：
 
 ```dotenv
 SSH_KEY_2=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... admin2
 SSH_KEY_3=ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... emergency
 ```
+
+配置值的优先级是：命令行参数、当前进程环境变量、`.env` 文件。
 
 ### 3. 初始化服务注册表和 SSH 公钥
 
@@ -124,7 +155,19 @@ SSH_KEY_3=ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... emergency
 python3 deploy.py init
 ```
 
-`init` 会读取 `.env` 中严格命名为 `SSH_KEY_1`、`SSH_KEY_2` 等的公钥，将它们原子写入 `/root/.ssh/authorized_keys`，并把目录和文件权限分别设置为 `0700`、`0600`。随后创建 `/etc/ssh/sshd_config.d/00-nano-xray.conf`：
+`init` 会完成以下操作：
+
+- 从 `.env` 和当前进程环境读取 `SSH_KEY_1`、`SSH_KEY_2` 等公钥。
+- 校验公钥类型和 base64 key body，并按真实 key identity 去重。
+- 保留已有 `authorized_keys` 内容，只追加尚不存在的公钥。
+- 原子写入 `/root/.ssh/authorized_keys`，目录权限设为 `0700`，文件权限设为 `0600`。
+- 写入 `/etc/ssh/sshd_config.d/00-nano-xray.conf`，启用公钥认证和 root 公钥登录。
+- 依次运行 `sshd -t` 和 `sshd -T`，确认最终有效配置正确。
+- 优先 reload `sshd.service`，在系统只提供 `ssh.service` 时自动回退。
+- 检测公网 IPv4，初始化 UUID 和 WebSocket path，并写入 `services.json`。
+- 验证 Cloudflare API Token。
+
+公钥模式下受管 sshd 配置为：
 
 ```text
 PubkeyAuthentication yes
@@ -132,11 +175,11 @@ AuthorizedKeysFile .ssh/authorized_keys
 PermitRootLogin prohibit-password
 ```
 
-脚本会先运行 `sshd -t`，再用 `sshd -T` 核对最终生效值，成功后优先 reload `sshd.service`，并兼容回退到 `ssh.service`。校验或 reload 失败会恢复原 drop-in。未配置任何 `SSH_KEY_N` 时，`init` 不会改写现有 `authorized_keys` 或 sshd 策略。
+如果校验或 reload 失败，脚本会恢复原来的 drop-in。未配置任何 `SSH_KEY_N` 时，`init` 不修改现有 `authorized_keys` 或 sshd 策略。
 
-除 SSH 配置外，`init` 还会检测公网 IPv4，生成或采用指定的 UUID 与 WebSocket 路径，写入 `services.json`，并验证 Cloudflare Token。如果 `services.json` 已存在，`init` 会先完成幂等的 SSH 公钥检查，再询问是否覆盖服务注册表；选择不覆盖不会撤销已经完成的 SSH 修复。已有生产节点不要随意覆盖 `services.json`。
+如果 `services.json` 已存在，`init` 会先执行幂等的 SSH 公钥检查，再询问是否覆盖服务注册表。已有生产节点通常应选择保留，避免更换默认 UUID 和 path。
 
-也可以用命令行明确指定参数：
+也可以通过参数提供初始化值：
 
 ```bash
 python3 deploy.py init \
@@ -147,52 +190,38 @@ python3 deploy.py init \
   --vmess-ws-path '/vmess-secret-path'
 ```
 
-### 4. 添加代理并启动
+### 4. 添加代理
 
 ```bash
-python3 deploy.py add-proxy --domain hk.example.com
-python3 deploy.py add-proxy --domain jp.example.com
+python3 deploy.py add-proxy --domain tw.qadmlee.com
 python3 deploy.py up --generate
 ```
 
-`add-proxy` 默认使用初始化时的 UUID 和路径，创建 DNS-only Cloudflare A 记录，并只更新源配置。首次启动必须使用 `up --generate`。
+`add-proxy` 默认使用 `init` 创建的 UUID 和 path，创建 Cloudflare DNS-only A 记录，并更新 `services.json`。首次启动必须使用 `up --generate`。
+
+容器名由域名第一段生成：
+
+```text
+tw.qadmlee.com → xray-tw
+```
+
+这条命名规则也用于自动识别本机 Node。要使用简化 Link 流程，本机第一个 proxy 域名应有清晰且唯一的第一段，例如 `tw.qadmlee.com`、`hk1.example.com`。
 
 常用变体：
 
 ```bash
-# 指定 UUID
-python3 deploy.py add-proxy -d hk.example.com -u 'UUID'
+# 指定该代理 UUID
+python3 deploy.py add-proxy -d tw.qadmlee.com -u 'UUID'
 
-# 单独生成新 UUID
-python3 deploy.py add-proxy -d hk.example.com --new-uuid
+# 为该代理单独生成新 UUID
+python3 deploy.py add-proxy -d tw.qadmlee.com --new-uuid
 
 # DNS 由其他系统管理
-python3 deploy.py add-proxy -d hk.example.com --no-dns
+python3 deploy.py add-proxy -d tw.qadmlee.com --no-dns
 
 # 覆盖同域名服务，并允许更新不同 IP 的 DNS 记录
-python3 deploy.py add-proxy -d hk.example.com --force
+python3 deploy.py add-proxy -d tw.qadmlee.com --force
 ```
-
-## 命令
-
-| 命令 | 说明 |
-|------|------|
-| `prepare` | 安装 Docker/UFW/fail2ban/nftables、创建 `.env`；可选配置密码认证策略 |
-| `init` | 从 `.env` 安装 root 公钥、验证 sshd，并初始化服务注册表 |
-| `add-proxy -d <域名>` | 添加代理节点 (自动创建 DNS) |
-| `add-service -d <域名> -t <目标>` | 添加服务反代 (localhost 自动转为 host.docker.internal) |
-| `remove -d <域名>` | 删除绑定 (自动删除 DNS) |
-| `list` | 列出所有服务 |
-| `up` | 使用现有配置启动 Docker，不重新生成配置 |
-| `up --generate` | 重新生成配置并启动 Docker（首次部署或更新源配置后） |
-| `reload` | 重新生成配置；容器集合不变时热加载 Caddy，否则更新 Compose |
-| `generate` | 仅生成配置文件 |
-| `check-traffic` | 检查当月流量，超限后除 TCP 22 外锁定入站、出站和转发流量 |
-| `update-ips -d <域名>` | 管理服务 IP 白名单 |
-| `node add/import/list/update/remove/detach` | 管理 v2 Node 期望配置 |
-| `link add/list/enable/disable/remove` | 管理 v2 有向 Link 期望配置 |
-| `plan` | 生成 v2 影响范围与发布计划，不修改远程节点 |
-| `apply --plan <文件>` | 校验计划；WG L3 发布闸门通过前会安全拒绝远程应用 |
 
 ## 日常单机管理
 
@@ -202,400 +231,434 @@ python3 deploy.py add-proxy -d hk.example.com --force
 python3 deploy.py list
 ```
 
-输出包含代理域名、容器名、UUID、VLESS/VMess 路径和普通反代目标。
+输出包含代理域名、容器名、UUID、VLESS/VMess path 和普通反代目标。
+
+### 添加普通 HTTPS 反向代理
+
+```bash
+# 反代宿主机服务；localhost 会自动转换
+python3 deploy.py add-service \
+  --domain api.example.com \
+  --target localhost:8317
+
+# 增加来源 IP 白名单
+python3 deploy.py add-service \
+  --domain admin.example.com \
+  --target localhost:8080 \
+  --allow-ips 1.2.3.0/24,5.6.7.8
+
+python3 deploy.py reload
+```
+
+Caddy 运行在 Docker 容器内，容器中的 `localhost` 不是宿主机。脚本会把 `localhost` 或 `127.0.0.1` 转成 `host.docker.internal`，并在 Compose 中添加宿主机映射。
+
+管理已有白名单：
+
+```bash
+python3 deploy.py update-ips -d admin.example.com --list
+python3 deploy.py update-ips -d admin.example.com --add 10.0.0.0/8
+python3 deploy.py update-ips -d admin.example.com --remove 5.6.7.8
+python3 deploy.py reload
+```
+
+白名单为空表示允许所有来源。
 
 ### 删除服务
 
 ```bash
-# 删除源配置，并尝试删除 Cloudflare DNS 记录
-python3 deploy.py remove --domain hk.example.com
+# 删除 services.json 中的服务，并尝试删除 Cloudflare DNS 记录
+python3 deploy.py remove --domain api.example.com
 
-# 删除源配置，但保留 DNS 记录
-python3 deploy.py remove --domain hk.example.com --keep-dns
+# 删除服务但保留 DNS 记录
+python3 deploy.py remove --domain api.example.com --keep-dns
 
-# 让删除结果生效
 python3 deploy.py reload
 ```
 
-### 配置生成与启动语义
+### 生成、启动和 reload 的区别
 
-| 命令 | 是否重新生成 `generated/` | 是否操作容器 |
-|---|---:|---:|
-| `generate` | 是 | 否 |
-| `up` | 否 | 执行 `docker compose up -d` |
-| `up --generate` | 是 | 执行 `docker compose up -d` |
-| `reload` | 是 | 容器集合变化时 compose up，否则热加载 Caddy |
+| 命令 | 是否重写 `generated/` | 对容器的操作 |
+|---|---:|---|
+| `generate` | 是 | 不操作容器 |
+| `up` | 否 | 使用现有配置执行 `docker compose up -d` |
+| `up --generate` | 是 | 生成后执行 `docker compose up -d` |
+| `reload` | 是 | 容器集合变化时 Compose 更新；否则只热加载 Caddy |
 
-持久修改应写入 `.env`、`services.json` 或通过脚本命令完成。`generate`、`up --generate` 和 `reload` 会覆盖脚本管理的生成文件。
+`generated/` 是脚本管理的生成目录。持久修改应写入 `.env`、`services.json` 或通过脚本命令完成。`generate`、`up --generate` 和 `reload` 都会覆盖其中的手工修改。
+
+普通 `up` 不读取 `.env` 或 `services.json`，也不重新生成配置。如果 `generated/docker-compose.yml` 不存在，它会要求先执行：
+
+```bash
+python3 deploy.py up --generate
+```
+
+`reload` 在容器集合没有变化时只热加载 Caddy，不会让 Xray 进程重新读取配置。Link 变更必须使用对应的 `apply --link <ID>`。
+
+只要当前 `services.json` 能识别出本机 Node，后续 `generate`、`up --generate` 和 `reload` 生成 Xray 文件时都会保留 inventory 中已启用的本机 Link，不会把 Link 配置覆盖丢失。但生成文件不等于让正在运行的 Xray 重读文件；Link 状态发生变化后仍应执行 `apply`。
 
 ### 查看容器和日志
 
 ```bash
 docker compose -f generated/docker-compose.yml ps
 docker logs caddy --tail 100
-docker logs xray-hk --tail 100
+docker logs xray-tw --tail 100
 ```
 
-## v2 Node + Link 基础功能
+## 客户端配置
 
-### 当前模型
+### 节点直连
 
-- **Node** 是一台完整、可独立提供代理服务的 VPS。
-- **Service** 是 Node 上的 Xray 代理或普通反向代理。
-- **Link** 是明确的有向中转关系，例如 `hk1 → us1`。
-
-创建 `hk1 → us1` 只增加一个经 US1 出口的入口身份，不取消 HK1 和 US1 的本机直出。存在 `hk1 → us1` 和 `us1 → de1` 时，也不会自动产生 `hk1 → us1 → de1`。
-
-所有部署运行代码均内嵌在 `deploy.py`。Node + Link 控制面数据写在管理目录中：
-
-```text
-inventory/topology.json
-inventory/nodes/<node-id>/services.json
-state/staging/<topology-hash>/<node-id>/
-plans/*.json
-```
-
-这些文件可能含有 UUID、Cloudflare Token 或节点信息，默认不提交 Git；仍需自行限制访问并备份。
-
-### 登记新 Node
-
-```bash
-python3 deploy.py node add hk1 \
-  --host root@203.0.113.10 \
-  --endpoint 203.0.113.10 \
-  --domain hk.example.com \
-  --remote-dir /root/nano-xray \
-  --network-profile host-l3 \
-  --ssh-key ~/.ssh/nano_xray_ed25519
-```
-
-参数说明：
-
-| 参数 | 说明 |
-|---|---|
-| `node_id` | 小写 Node ID，只允许小写字母、数字和连字符 |
-| `--host` | OpenSSH 目标，例如 `root@203.0.113.10` |
-| `--endpoint` | WireGuard 公网地址；省略时取 `--host` 中 `@` 后的部分 |
-| `--domain` | 新 Node 的默认代理域名；`node add` 时必需 |
-| `--remote-dir` | 远程项目目录，默认 `/root/nano-xray` |
-| `--network-profile` | `bridge` 或 `host-l3`，默认 `bridge` |
-| `--ssh-key` | OpenSSH 私钥文件路径 |
-
-`node add` 只修改管理机上的期望配置，并为该 Node 创建包含随机 UUID 和路径的本地 `services.json`。它不会连接 VPS、创建 Cloudflare DNS 或启动远程容器。
-
-### 导入已有 Node
-
-通过 SSH 读取远程 `services.json`：
-
-```bash
-python3 deploy.py node import hk1 \
-  --host root@203.0.113.10 \
-  --remote-dir /root/nano-xray \
-  --network-profile host-l3 \
-  --ssh-key ~/.ssh/nano_xray_ed25519
-```
-
-OpenSSH 使用 `BatchMode=yes` 和正常的 `known_hosts` 校验。首次导入前应手工连接并核对 host key：
-
-```bash
-ssh -i ~/.ssh/nano_xray_ed25519 root@203.0.113.10
-```
-
-也可以从本地备份导入，不发起 SSH：
-
-```bash
-python3 deploy.py node import hk1 \
-  --host root@203.0.113.10 \
-  --services-file ./backups/hk1-services.json \
-  --network-profile host-l3
-```
-
-导入会保留原服务域名、UUID、WebSocket 路径和容器名，并为 host-l3 代理服务持久分配互不冲突的 loopback 端口。
-
-### 查看和更新 Node
-
-```bash
-python3 deploy.py node list
-
-python3 deploy.py node update hk1 \
-  --host root@203.0.113.20 \
-  --endpoint 203.0.113.20 \
-  --remote-dir /root/nano-xray \
-  --network-profile host-l3 \
-  --ssh-key ~/.ssh/nano_xray_ed25519
-```
-
-`node update` 只需填写要修改的字段。它同样只修改本地期望配置。
-
-### 创建有向 Link
-
-两端 Node 必须已经登记并使用 `host-l3`。`--entry-service` 必须对应 source Node 的 proxy Service；可填写完整域名、域名第一段、容器名，或去掉 `xray-` 前缀后的名字。
-
-```bash
-python3 deploy.py node list
-cat inventory/nodes/hk1/services.json
-
-python3 deploy.py link add hk1 us1 \
-  --id hk1-us1 \
-  --entry-service xray-hk \
-  --protocol both \
-  --transport wg-l3
-```
-
-`--protocol` 可选 `vmess`、`vless` 或 `both`，默认 `both`。脚本会稳定分配 `/30` 地址、`nxNNNN` 接口名、WG UDP 端口、socket mark、路由表、规则优先级和 Link 专属 UUID。后续新增其他 Link 不会改变已有分配。
-
-### 管理 Link 生命周期
-
-```bash
-python3 deploy.py link list
-python3 deploy.py link disable hk1-us1
-python3 deploy.py link enable hk1-us1
-python3 deploy.py link remove hk1-us1
-```
-
-- `disable` 保留 Link 和资源，但渲染时不提供该 Link 的客户端和出站。
-- `enable` 使用原资源恢复期望配置。
-- `remove` 将 Link 转为 tombstone，避免旧地址、端口、mark 和 UUID 被立即复用。
-
-这些命令目前只修改期望配置，不会立即改变远程服务器。
-
-### 从 Node 移除 Link 关系
-
-```bash
-# 移除所有指向 us1 的 Link
-python3 deploy.py node detach us1 --incoming
-
-# 移除所有从 hk1 发出的 Link
-python3 deploy.py node detach hk1 --outgoing
-
-# 移除 hk1 的全部入向和出向 Link
-python3 deploy.py node detach hk1 --all-links
-```
-
-detach 不删除 Node 的独立服务。删除 Node 前必须先移除活动 Link；存在待清理 tombstone 时，`node remove` 也会拒绝：
-
-```bash
-python3 deploy.py node remove hk1
-```
-
-### 生成并检查 Plan
-
-```bash
-# 全拓扑
-mkdir -p plans
-python3 deploy.py plan --save plans/all.json
-
-# 指定 Link；自动包含两端 Node
-python3 deploy.py plan --links hk1-us1 --save plans/hk1-us1.json
-
-# 指定一个或多个 Node
-python3 deploy.py plan --nodes hk1,us1 --save plans/hk-us.json
-```
-
-选择 Link 时会包含它的两端；选择 Node 时会包含与该 Node 直接相连的 Link 及另一端，但不会递归扩展为未声明的多跳拓扑。
-
-Plan 记录 topology SHA-256、受影响 Node/Link、tombstone 清理动作、staging 目录和每个生成文件的 SHA-256。host-l3 产物示例：
-
-```text
-state/staging/<topology-hash-prefix>/<node-id>/
-├── .env
-├── caddy/Caddyfile
-├── docker-compose.yml
-├── node-manifest.json
-└── xray/<service-id>/config.json
-```
-
-生成的 Xray 配置保留原用户本机直出，并为启用的 Link 增加专属用户、按 email 匹配的路由、`sendThrough` 和 socket mark。Caddy/Xray 使用 host networking 和持久分配的 loopback 端口。
-
-### 当前 apply 行为
-
-```bash
-python3 deploy.py apply --plan plans/hk1-us1.json
-```
-
-`apply` 会先确认 Plan 的 topology hash 仍与当前期望配置一致。拓扑在 Plan 生成后发生变化时会报告 Plan 已过期。
-
-当前 Plan 明确包含 `apply_supported: false`，因此未过期的 Plan 也会安全拒绝远程执行。WireGuard、策略路由、NAT、防火墙和远程回滚必须先在隔离 Debian 环境通过发布闸门；当前命令不会修改生产节点网络。
-
-## 单机参数与反代示例
-
-### 启动已有配置
-
-```bash
-# 使用 generated/ 中的现有配置启动，不覆盖手工修改
-python3 deploy.py up
-
-# 明确重新生成配置后启动（保留原 up 的行为）
-python3 deploy.py up --generate
-```
-
-普通 `up` 不读取 `services.json`，也不要求项目根目录存在 `.env`。
-如果 `generated/docker-compose.yml` 不存在，会报错退出，不会自动生成。
-首次部署或通过 `add-proxy` 等命令修改源配置后，使用 `up --generate`。
-
-`--generate` 会覆盖生成目录中的配置。`generate` 和 `reload` 的行为保持不变，
-仍会重新生成配置，因此仍可能覆盖手工修改。
-`up` 不保证运行中的 Xray 重新读取手工修改的配置；本次调整仅分离配置生成与启动。
-
-### init 参数
-
-| 参数 | 说明 |
-|------|------|
-| `-t, --token` | Cloudflare API Token (也可在 .env 中配置) |
-| `-r, --redirect` | 默认重定向 URL (也可在 .env 中配置) |
-| `-u, --uuid` | 指定默认 UUID (也可在 .env 中配置) |
-| `--vless-ws-path` | 指定 VLESS WS 路径 (也可在 .env 中配置) |
-| `--vmess-ws-path` | 指定 VMess WS 路径 (也可在 .env 中配置) |
-
-### 通用参数
-
-| 参数 | 适用命令 | 说明 |
-|------|---------|------|
-| `-f, --force` | add-proxy, add-service | 域名已存在时强制覆盖 |
-| `--no-dns` | add-proxy, add-service | 跳过自动 DNS 创建 |
-| `--keep-dns` | remove | 删除时保留 DNS 记录 |
-| `--new-uuid` | add-proxy | 强制生成新 UUID |
-| `--allow-ips` | add-service | IP 白名单，逗号分隔 (如 `1.2.3.0/24,5.6.7.8`) |
-
-### prepare 的 SSH 参数
-
-| 参数 | 说明 |
-|---|---|
-| `--configure-ssh-password-auth` | 显式启用 root 密码和键盘交互认证；默认保留现有密码认证策略 |
-
-### 服务反代示例
-
-```bash
-# 反代宿主机服务（localhost 会自动转为 host.docker.internal）
-python3 deploy.py add-service -d api.example.com -t localhost:8317
-
-# 也可以直接指定 host.docker.internal
-python3 deploy.py add-service -d api.example.com -t host.docker.internal:8317
-
-# 设置 IP 白名单
-python3 deploy.py add-service -d admin.example.com -t localhost:8080 --allow-ips 1.2.3.0/24,5.6.7.8
-
-# 追加 / 删除 / 查看 IP
-python3 deploy.py update-ips -d admin.example.com --add 10.0.0.0/8
-python3 deploy.py update-ips -d admin.example.com --remove 5.6.7.8
-python3 deploy.py update-ips -d admin.example.com --list
-```
-
-> **注意**: Caddy 运行在 Docker 容器内，`localhost` 指向容器自身而非宿主机。脚本会自动将 `localhost` / `127.0.0.1` 转为 `host.docker.internal`，并在 docker-compose.yml 中添加 `extra_hosts` 映射。
-
-## .env 配置
-
-`prepare` 命令会自动生成 `.env` 模板，编辑填入即可：
-
-```dotenv
-CF_API_TOKEN=xxx              # 必填
-DEFAULT_UUID=                 # 可选，init 时自动生成
-DEFAULT_VLESS_WS_PATH=        # 可选，init 时自动生成
-DEFAULT_VMESS_WS_PATH=        # 可选，init 时自动生成
-REDIRECT_URL=                 # 必填，非 WS 路径重定向目标
-
-# SSH 公钥（支持多个：SSH_KEY_1, SSH_KEY_2, ...）
-SSH_KEY_1=ssh-rsa AAAA... user1
-SSH_KEY_2=ssh-ed25519 AAAA... user2
-
-# 流量监控 (check-traffic 命令)
-TRAFFIC_LIMIT_GB=180          # 流量阈值 (GB)，check-traffic 必填
-VNSTAT_IFACE=ens4             # 可选，指定网卡（默认自动跳过 docker0/lo）
-TELEGRAM_BOT_TOKEN=           # 可选，告警通知
-TELEGRAM_CHAT_ID=             # 可选，告警通知
-```
-
-优先级：**CLI 参数 > 环境变量 > `.env` 文件**
-
-正常顺序是先运行 `prepare` 创建模板，再编辑 `.env`，最后运行 `init`。`init` 会合并当前进程环境和 `.env` 中严格命名为 `SSH_KEY_1`、`SSH_KEY_2` 等的变量，并根据 key type 与 base64 key body 去重；同一个 key 仅评论不同不会重复添加。再次运行 `init` 时，已有 key 不会重复写入。
-
-`.env` 和 `services.json` 包含敏感信息，不要提交到公开仓库。项目的 `.gitignore` 已默认忽略它们。
-
-## 客户端配置参数
-
-先取得当前节点的实际参数：
+先读取当前代理的参数：
 
 ```bash
 python3 deploy.py list
 ```
 
-VLESS 客户端参数：
+VLESS 配置：
 
 | 字段 | 值 |
 |---|---|
-| 服务器 | 代理域名，例如 `hk.example.com` |
+| 服务器 | 当前代理域名，例如 `tw.qadmlee.com` |
 | 端口 | `443` |
 | UUID | `list` 输出的 UUID |
 | 传输 | WebSocket |
-| WebSocket Path | `list` 输出的 VLESS 路径 |
+| WebSocket Path | `list` 输出的 VLESS path |
 | TLS | 开启 |
-| SNI / Host | 代理域名 |
+| SNI / Host | 当前代理域名 |
 | 加密 | `none` |
 
-VMess 客户端参数：
+VMess 配置：
 
 | 字段 | 值 |
 |---|---|
-| 服务器 | 代理域名，例如 `hk.example.com` |
+| 服务器 | 当前代理域名，例如 `tw.qadmlee.com` |
 | 端口 | `443` |
 | UUID | `list` 输出的 UUID |
 | 传输 | WebSocket |
-| WebSocket Path | `list` 输出的 VMess 路径 |
+| WebSocket Path | `list` 输出的 VMess path |
 | TLS | 开启 |
-| SNI / Host | 代理域名 |
+| SNI / Host | 当前代理域名 |
 
-同一域名上的 VLESS 与 VMess 使用不同 WebSocket 路径。不要把两个路径互换。
+同一域名上的 VLESS 和 VMess 使用不同 WebSocket path，不要混用。
 
-## 流量监控
+### Link 客户端
 
-防止 GCP 等云服务持续产生超额流量。该功能使用 vnstat 统计用量，并通过 nano-xray 独占的 nftables 表实施紧急网络锁，同时支持 Telegram 告警。检查是周期性的，因此阈值不是云账单的绝对上限；两次检查之间仍可能产生额外流量。
+`link add jp` 会打印 Link 专属客户端 UUID。配置 TW → JP 客户端时：
 
-紧急网络锁只保留标准 TCP 22。若服务器 SSH 使用其他端口，超量后该 SSH 连接也会被阻断；启用流量保护前应确保 TCP 22 可以作为管理入口。
+| 字段 | 值 |
+|---|---|
+| 服务器 | source 的代理域名，例如 `tw.qadmlee.com` |
+| 端口 | `443` |
+| UUID | `link add jp` 输出的客户端 UUID |
+| VLESS/VMess | 由 `--protocol` 决定，默认两者都支持 |
+| WebSocket Path | source 对应协议原有的 path |
+| TLS、SNI、Host | 开启并填写 source 代理域名 |
 
-### 前提
+Link UUID 与 source 原有直连 UUID 不同。Xray 根据 Link UUID 识别该用户，并把流量转给 JP；使用原直连 UUID 时仍从 TW 本机直接出站。
 
-```bash
-apt install vnstat    # 流量统计
-apt install nftables  # 全局流量锁；prepare 已自动安装
+项目目前没有 Surge 自动导出命令，需要按上述字段手工创建客户端条目。Link UUID 持久保存在 `inventory/topology.json`，不要公开或随意修改该文件。
+
+## 本机 Node + Link
+
+### 工作模型
+
+每台服务器都是独立 Node。Link 只是 source Xray 中的一条额外路由：
+
+```text
+直连账号：客户端 → TW Caddy → TW Xray → Internet
+
+Link 账号：客户端 → TW Caddy → TW Xray
+          → VLESS/VMess + WebSocket + TLS
+          → JP Caddy → JP Xray → Internet
 ```
 
-### 配置 cron
+当前方案不使用 WireGuard、隧道地址、策略路由或 NAT。它复用 target 已经存在的公网 Xray 服务，因此无需登录、配置或重启 target。
+
+Link 是显式单跳关系。即使 inventory 中同时存在 `tw → jp` 和 `jp → us`，`tw → jp` 也不会自动变成 `tw → jp → us`。
+
+### 本机 Node 如何识别
+
+执行 `node list`、`link add`、`link del` 或 `apply` 时，脚本读取当前目录的 `services.json`：
+
+1. 找到第一个 `type=proxy` 的 Service。
+2. 取其域名第一段作为本机 Node ID。
+3. 要求其容器名为 `xray-<Node ID>`。
+4. 把本机 `services.json` 同步到 `inventory/nodes/<Node ID>/services.json`。
+
+例如：
+
+```text
+domain:         tw.qadmlee.com
+Node ID:        tw
+entry_service:  xray-tw
+```
+
+因此本机不需要执行 `node import tw`，也不需要在命令中填写 source、Link ID 或 entry service。
+
+如果当前 `services.json` 没有 proxy，或第一个 proxy 的容器名不符合 `xray-<域名前缀>`，简化 Link 命令会拒绝继续，并给出明确错误。
+
+### TW → JP 完整流程
+
+#### 1. 在 JP 确认代理可用
+
+JP 应先完成自己的单机部署：
+
+```bash
+# 在 JP 上
+python3 deploy.py list
+docker compose -f generated/docker-compose.yml ps
+```
+
+#### 2. 把 JP 的 `services.json` 复制到 TW
+
+复制方式由你决定。`deploy.py` 不发起 SSH，也不读取远程服务器。建议在 TW 上保留一个容易识别的导入文件：
+
+```text
+/root/nano-xray/imports/jp-services.json
+```
+
+#### 3. 在 TW 导入 JP
+
+```bash
+# 在 TW 的 nano-xray 目录
+python3 deploy.py node import jp \
+  --services-file ./imports/jp-services.json
+```
+
+脚本会校验 JSON，并把副本写到：
+
+```text
+inventory/nodes/jp/services.json
+```
+
+后续修改或删除 `./imports/jp-services.json` 不会改变 inventory 中的副本。
+
+`node_id` 只允许小写字母、数字和连字符。建议使用 target 域名前缀，例如 `jp`、`us1`。
+
+查看当前 inventory：
+
+```bash
+python3 deploy.py node list
+```
+
+该命令也会自动同步本机 Node。
+
+#### 4. 创建 Link
+
+```bash
+python3 deploy.py link add jp
+```
+
+假设当前第一个 proxy 是 `tw.qadmlee.com`，脚本自动创建：
+
+```text
+source:          tw
+target:          jp
+Link ID:         tw-jp
+entry_service:   xray-tw
+exit_service:    JP 唯一的 proxy Service
+客户端协议:      VLESS 和 VMess
+TW 连接 JP 协议: VLESS + WebSocket + TLS
+```
+
+同一台 source 到同一 target 最多存在一条 Link。重复运行 `link add jp` 会报告 `Link 已存在`，不会重复添加或更换 UUID。
+
+如果 JP 有多个 proxy Service，脚本无法替你判断应使用哪一个，需要明确选择：
+
+```bash
+python3 deploy.py link add jp \
+  --exit-service xray-jp-main
+```
+
+完整可选参数：
+
+```bash
+python3 deploy.py link add jp \
+  --protocol both \
+  --exit-protocol vless \
+  --exit-service xray-jp-main
+```
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `target` | 必填 | 目标 Node，例如 `jp` |
+| `--protocol` | `both` | Link 专属 UUID 允许客户端使用 `vless`、`vmess` 或两者 |
+| `--exit-protocol` | `vless` | source Xray 连接 target 时使用 `vless` 或 `vmess` |
+| `--exit-service` | 自动选择 | target 有多个 proxy 时选择其中一个 |
+| `--transport` | `xray` | 当前唯一可选值，用于 inventory schema |
+
+#### 5. 应用 Link
+
+```bash
+python3 deploy.py apply --link tw-jp
+```
+
+`apply` 必须在 TW 本机执行。它会：
+
+1. 重新从当前 `services.json` 确认本机确实是 `tw`。
+2. 使用 TW 的全部已启用出向 Link 生成 Xray 配置。
+3. 将待应用配置暂存到 `state/apply-staging/<拓扑哈希>/`。
+4. 使用 `ghcr.io/xtls/xray-core:26.2.6` 在隔离网络中运行配置校验。
+5. 再次核对 topology hash，防止校验期间期望配置被并发修改。
+6. 将当前 Xray 配置备份到 `state/backups/<时间>-tw-jp/config.json`。
+7. 原子替换 `generated/xray/xray-tw/config.json`。
+8. 只强制重建 `xray-tw` 容器，并检查它是否处于 Running 状态。
+9. 失败时恢复旧配置并重新启动原容器。
+
+`apply` 不修改 Caddy、其他 Xray 容器或 JP。如果本机还没有生成运行配置，会要求先执行：
+
+```bash
+python3 deploy.py up --generate
+python3 deploy.py apply --link tw-jp
+```
+
+#### 6. 配置客户端并验证出口
+
+使用 `link add jp` 打印的 Link UUID，连接地址仍是 `tw.qadmlee.com:443`，path 仍使用 TW 对应协议的原有 path。连接后检查公网出口应为 JP。
+
+TW 原来的 UUID 继续从 TW 本机直出，不受 Link 影响。
+
+### 更新 target 信息
+
+如果 JP 更换了代理域名、UUID 或 WebSocket path，把最新的 JP `services.json` 再次复制到 TW，然后执行：
+
+```bash
+python3 deploy.py node import jp \
+  --services-file ./imports/jp-services.json
+python3 deploy.py apply --link tw-jp
+```
+
+重复导入会更新 JP 的 inventory 副本，但保留现有 Link ID 和 Link 客户端 UUID。`apply` 后 TW 才会使用 JP 的新连接参数。
+
+### 启用、停用和删除 Link
+
+查看 Link：
+
+```bash
+python3 deploy.py link list
+```
+
+临时停用并应用：
+
+```bash
+python3 deploy.py link disable tw-jp
+python3 deploy.py apply --link tw-jp
+```
+
+停用保留 Link 和客户端 UUID，但 Xray 配置不再接受该 Link 身份或生成对应 outbound。
+
+重新启用并应用：
+
+```bash
+python3 deploy.py link enable tw-jp
+python3 deploy.py apply --link tw-jp
+```
+
+删除本机到 JP 的 Link：
+
+```bash
+python3 deploy.py link del jp
+python3 deploy.py apply --link tw-jp
+```
+
+`link del jp` 自动推导本机 source 和内部 Link ID，只删除 `tw → jp`。它不会影响：
+
+- TW 原来的直连账号。
+- JP 自己的服务。
+- TW 到其他 target 的 Link。
+- 其他服务器上存在的任何 Link。
+
+删除时会在 topology 中留下临时 tombstone，使已经运行的 Link 能通过随后一次 `apply --link tw-jp` 从 Xray 配置中安全移除。应用成功后 tombstone 自动清理。
+
+旧 inventory 如果存在同一 source 到同一 target 的多条自定义 ID Link，`link del jp` 会拒绝猜测；此时可使用兼容命令：
+
+```bash
+python3 deploy.py link remove <旧Link-ID>
+python3 deploy.py apply --link <旧Link-ID>
+```
+
+### 可选 Plan
+
+正常新增或删除 Link 不需要 `plan`。如果希望在应用前保存一份只读审查结果，可以执行：
+
+```bash
+mkdir -p plans
+python3 deploy.py plan --links tw-jp --save plans/tw-jp.json
+```
+
+Plan 会记录 topology SHA-256、受影响的 source Node、Link、清理动作和生成文件哈希，并把独立的兼容审查草稿写到：
+
+```text
+state/staging/<拓扑哈希>/tw/
+```
+
+这些草稿来自旧 topology renderer，与实际 `apply` 的暂存目录分开。它们不会修改 `generated/` 或运行中的容器，也不是 `apply` 将要安装的精确配置；当前简化流程可直接跳过 Plan。
+
+### 兼容的 inventory 管理命令
+
+CLI 仍保留 `node add`、`node update`、`node detach`、`node remove` 和 `link remove`，用于读取或整理旧版 topology。当前“本机自动 source + 手工文件导入 target”的日常流程不需要 `node add`、`node update` 或 `node detach`。
+
+需要删除已不再使用的 target Node 时，应先删除指向它的 Link、完成 tombstone apply，再执行：
+
+```bash
+python3 deploy.py node remove jp
+```
+
+存在活动 Link 或待应用 tombstone 时，`node remove` 会拒绝删除，避免留下损坏的引用。
+
+## 流量监控与紧急网络锁
+
+`check-traffic` 使用 vnstat 读取当月出站流量 `tx`，按十进制 GB（10⁹ bytes）与 `TRAFFIC_LIMIT_GB` 比较。`prepare` 默认配置每小时一次和开机检查：
 
 ```cron
-# 每小时检查一次，并在重启后立即重新检查
 0 * * * * cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1
 @reboot cd /root/nano-xray && python3 deploy.py check-traffic >> /var/log/nano-xray-traffic.log 2>&1
 ```
 
-### 日志格式
+运行一次检查：
 
-```
-2026-02-16 16:00 oregon | 1.10/180 GB | OK
-2026-02-16 17:00 oregon | 182.30/180 GB | BLOCKED
-2026-02-17 00:00 oregon | 0.05/180 GB | UNBLOCKED
+```bash
+python3 deploy.py check-traffic
 ```
 
-### 工作原理
+示例输出：
 
-1. 自动识别真实网卡（跳过 docker0/lo/veth），也可通过 `VNSTAT_IFACE` 指定
-2. 读取 vnstat 当月出站流量 (tx)，用 GB (10⁹) 计算
-3. 流量 ≥ 阈值 → 先尝试发送 Telegram 告警，再启用紧急网络锁
-4. 网络锁只允许 loopback、TCP 22 的 SSH 服务/客户端流量，以及维持 IPv6 SSH 所需的邻居发现控制报文
-5. 其他主机入站、主机出站和 Docker/路由转发流量全部丢弃
-6. 流量回落到阈值以下 → 删除 nano-xray 独占的 nftables 表，恢复单机服务所需的 80/443 UFW 规则，并发送 Telegram 通知
-7. vnstat 或 nftables 不可用时报告错误，不会虚假输出 `BLOCKED`
-8. 重复检查不会重复添加 nftables 表
-9. 兼容 vnstat 2.6 (KiB) 和 2.10+ (bytes) JSON 格式
+```text
+2026-02-16 16:00 tw | 1.10/180 GB | OK
+2026-02-16 17:00 tw | 182.30/180 GB | BLOCKED
+2026-03-01 00:00 tw | 0.05/180 GB | UNBLOCKED
+```
 
-`VNSTAT_IFACE` 必须精确匹配 vnstat 中的接口名。未设置时，脚本会自动跳过 `lo`、Docker、bridge、veth、WireGuard 和 `nx*` 等虚拟接口，选择已有 vnstat 数据的真实网卡。
+超限时，脚本会启用独占 nftables 表 `inet nano_xray_traffic_guard`：
 
-查看当前网络锁：
+- 允许 loopback。
+- 允许 TCP 22 的 SSH 入站和出站，以及其已建立连接的反向流量。
+- 允许维持 IPv6 SSH 所需的邻居发现控制报文。
+- 丢弃其他所有主机入站。
+- 丢弃其他所有主机出站。
+- 丢弃全部 Docker/路由转发流量。
+
+因此网络锁覆盖的不只是 80/443 入站，也能停止普通进程、容器和转发产生的其他出站流量。通知会在锁定前发送，因为锁定后 Telegram 也无法访问。
+
+如果服务器 SSH 使用的不是 TCP 22，超限后该 SSH 端口也会被阻断。启用流量保护前应确保 TCP 22 可作为管理入口。
+
+低于阈值时，脚本删除自己的 nftables 表，恢复单机服务使用的 UFW 80/443 规则，并发送恢复通知。升级自旧版本时，它也会清理旧的 UFW 80/443 DENY 规则。
+
+其他行为：
+
+- 重复检查不会重复叠加 nftables 规则。
+- vnstat 或 nftables 不可用时返回错误，不会虚假报告 `BLOCKED`。
+- 兼容 vnstat 2.6 的 KiB JSON 和 vnstat 2.10+ 的 bytes JSON。
+- 未指定 `VNSTAT_IFACE` 时，会跳过 `lo`、Docker、bridge、veth、WireGuard 和 `nx*` 等虚拟接口，选择已有 vnstat 数据的真实网卡。
+- 检查是周期性的，所以流量阈值不是云账单的绝对上限；两次检查之间仍可能产生额外流量。
+
+查看网络锁：
 
 ```bash
 sudo nft list table inet nano_xray_traffic_guard
 ```
 
-需要人工紧急解除时：
+人工紧急解除：
 
 ```bash
 sudo nft delete table inet nano_xray_traffic_guard
@@ -604,74 +667,112 @@ sudo ufw allow 443/tcp
 sudo ufw allow 443/udp
 ```
 
-如果当月用量仍高于阈值，下一次 `check-traffic` 会再次启用网络锁。应先停掉导致流量的服务或调整监控策略，再人工解除。
+如果 vnstat 的当月用量仍高于阈值，下一次 `check-traffic` 会重新锁定网络。应先停止流量来源或调整阈值，再人工解除。
 
-## 当前实现边界
+## 命令速查
 
-已经可以直接使用：
+| 命令 | 说明 |
+|---|---|
+| `prepare` | 安装和配置系统组件，创建 `.env` 模板 |
+| `init` | 安装 `.env` 中的 root 公钥，验证 sshd，初始化 `services.json` |
+| `add-proxy -d <域名>` | 添加 VLESS/VMess 代理，可自动创建 DNS |
+| `add-service -d <域名> -t <目标>` | 添加普通 HTTPS 反向代理 |
+| `remove -d <域名>` | 删除 proxy 或普通反代，可自动删除 DNS |
+| `list` | 查看当前 `services.json` 中的服务和连接参数 |
+| `generate` | 重新生成配置，不操作容器 |
+| `up` | 使用现有 `generated/` 启动容器 |
+| `up --generate` | 重新生成配置并启动容器 |
+| `reload` | 重新生成；容器集合变化时更新 Compose，否则只 reload Caddy |
+| `update-ips` | 查看或修改普通反代的来源 IP 白名单 |
+| `check-traffic` | 检查月出站流量，超限时除 TCP 22 外锁定网络 |
+| `node import <target> --services-file <文件>` | 从本地文件导入或刷新 target |
+| `node list` | 自动同步并列出本机和已导入 target |
+| `link add <target>` | 自动建立本机到 target 的 Link 期望配置 |
+| `link del <target>` | 删除本机到 target 的 Link 期望配置 |
+| `link list` | 查看活动 Link |
+| `link enable/disable <ID>` | 启用或停用 Link 期望配置 |
+| `apply --link <ID>` | 在本机校验并应用该 source 的全部 Link；失败自动回滚 |
+| `plan` | 可选生成独立审查草稿，不修改运行配置 |
 
-- 旧版单机 Caddy/Xray 部署和管理。
-- 普通 HTTPS 反代和来源 IP 白名单。
-- Cloudflare DNS A 记录管理和 DNS-01 TLS。
-- vnstat/nftables 全局流量保护，并兼容清理旧版 UFW 80/443 DENY 规则。
-- Node 新增、导入、更新、查看、detach 和删除约束。
-- Link 新增、查看、启用、停用和删除。
-- 版本化 topology、严格校验、稳定资源分配和 tombstone。
-- host-l3 Caddy/Xray/Compose 渲染、影响范围计算和 Plan 保存。
-- 单独复制 `deploy.py` 后独立运行。
+所有子命令都可以使用 `--help` 查看当前参数：
 
-尚未开放：
-
-- 自动复制 staging 配置到远程 Node。
-- WireGuard 密钥生成和双方 peer 发布。
-- 远程策略路由、fail-closed、NAT 和 UFW/nftables 规则应用。
-- 多节点 prepare/commit/rollback。
-- Link doctor、Surge 导出和 Link 流量配额联动。
-
-成功生成 Plan 表示配置已经通过本地数据校验和渲染，不表示链路已经在远程服务器生效。
-
-## 文件结构
-
-```
-nano-xray/
-├── deploy.py              ← 管理脚本 (零依赖单文件)
-├── .env                   ← 环境配置 (不提交 Git)
-├── .env.example           ← 配置模板
-├── services.json          ← 服务注册表 (自动生成)
-└── generated/             ← 自动生成的部署文件
-    ├── Caddyfile
-    ├── docker-compose.yml
-    └── xray/*/config.json
+```bash
+python3 deploy.py --help
+python3 deploy.py link add --help
+python3 deploy.py apply --help
 ```
 
-作为 Node + Link 管理目录时还会出现：
+## 文件结构和敏感数据
+
+单机部署会产生：
 
 ```text
 nano-xray/
 ├── deploy.py
+├── .env
+├── services.json
+└── generated/
+    ├── .env
+    ├── Caddyfile
+    ├── docker-compose.yml
+    └── xray/<container>/config.json
+```
+
+Node + Link 会另外产生：
+
+```text
+nano-xray/
 ├── inventory/
 │   ├── topology.json
 │   └── nodes/<node-id>/services.json
 ├── state/
+│   ├── apply-staging/<topology-hash>/xray/...
+│   ├── backups/<time>-<link-id>/config.json
 │   └── staging/<topology-hash>/<node-id>/...
 └── plans/*.json
 ```
 
-生产服务器运行只需要 `deploy.py`。仓库中的 `tests/`、`pyproject.toml`、`uv.lock`、CI 配置和设计文档只用于开发与验证，不是运行时依赖。
+`.env`、`services.json`、`inventory/`、`state/` 和 `plans/` 可能包含 Cloudflare Token、代理 UUID、Link UUID、域名和其他敏感信息。项目 `.gitignore` 默认忽略这些路径；还应限制服务器文件权限并自行备份。
+
+服务器运行时只需要 `deploy.py`。仓库中的 `tests/`、`pyproject.toml`、`uv.lock`、CI 和设计文档只用于开发验证，不是远程部署依赖。
+
+## 当前实现范围
+
+已经实现：
+
+- 单机 Caddy/Xray 代理和普通反向代理管理。
+- Cloudflare DNS A 记录管理和 DNS-01 TLS。
+- SSH 公钥安装、sshd 有效配置检查、服务名兼容和失败恢复。
+- vnstat + nftables 全局流量保护。
+- 从本机文件导入 target Service，不使用 SSH。
+- 自动识别并同步本机 Node。
+- `link add <target>`、`link del <target>`、Link 启用/停用和去重。
+- VLESS/VMess over WebSocket + TLS 的单跳 Xray Link。
+- 本机 source-only apply、配置校验、备份、原子替换、容器重建和失败回滚。
+- 可选 Plan、版本化 topology、稳定 Link UUID 和删除 tombstone。
+- 单文件 `deploy.py` 独立交付。
+
+当前没有：
+
+- 远程多节点发布或 SSH 导入。
+- WireGuard 数据面。
+- 自动多跳路由。
+- Surge 配置自动导出。
+- Link doctor 或 Link 独立流量配额。
 
 ## 常见问题
 
-### `generated/docker-compose.yml 不存在`
+### `generated/docker-compose.yml` 不存在
 
-首次启动需要生成配置：
+首次启动或尚未生成配置时执行：
 
 ```bash
 python3 deploy.py up --generate
 ```
 
-### Cloudflare Token 验证失败或 DNS 没有创建
+### Cloudflare Token 验证失败或 DNS 没创建
 
-检查 Token 是否属于正确账号和 Zone，并具有 DNS Edit 与 Zone Read 权限。确认 `init` 检测到了正确的公网 IPv4，且命令没有使用 `--no-dns`。如果 DNS 由其他系统管理，可以自行创建 DNS-only A 记录。
+确认 Token 属于正确账号和 Zone，且具有 DNS Edit 与 Zone Read 权限。检查 `init` 是否检测到正确公网 IPv4，以及命令是否使用了 `--no-dns`。DNS 由其他系统管理时，可以自行创建 DNS-only A 记录。
 
 ### Caddy 无法签发证书
 
@@ -679,9 +780,9 @@ python3 deploy.py up --generate
 docker logs caddy --tail 200
 ```
 
-常见原因是 Cloudflare Token 权限不足、域名不在 Token 覆盖的 Zone、系统时间错误或 DNS 尚未传播。
+常见原因包括 Cloudflare Token 权限不足、域名不在 Token 覆盖的 Zone、系统时间错误或 DNS 尚未传播。
 
-### 普通反代返回 502
+### 普通反向代理返回 502
 
 先在宿主机确认后端可访问：
 
@@ -690,61 +791,78 @@ curl -v http://127.0.0.1:8317/
 docker logs caddy --tail 100
 ```
 
-目标如果是另一个 Docker 容器，需要填写 Caddy 容器实际可达的地址；不要假定任意容器名都能跨 Docker 网络解析。
+目标是另一个 Docker 容器时，应填写 Caddy 容器实际可达的地址，不能假定任意容器名都能跨网络解析。
 
 ### 修改 `generated/` 后没有生效
 
-普通 `up` 不会覆盖文件，但也不保证运行中的进程重新读取文件。`reload` 会先重新生成配置，因此会覆盖脚本管理的手工修改。Xray 配置变化时应使用 `up --generate` 明确重建所需容器。
+普通 `up` 不会覆盖文件，但也不保证已经运行的进程重新读取文件。`reload` 会先重新生成并覆盖脚本管理的文件，且在容器集合不变时只 reload Caddy。
 
-### `node import` SSH 失败
+持久的单机修改应写入源配置；Link 修改应通过 `link` 命令完成并执行 `apply --link <ID>`。
 
-先用相同参数直接测试：
+### `node import` 无法读取文件
+
+确认文件已经复制到当前服务器，并检查路径、权限和 JSON：
 
 ```bash
-ssh -o BatchMode=yes -i ~/.ssh/nano_xray_ed25519 \
-  root@203.0.113.10 \
-  'cat -- /root/nano-xray/services.json'
+ls -l ./imports/jp-services.json
+python3 -m json.tool ./imports/jp-services.json
+python3 deploy.py node import jp --services-file ./imports/jp-services.json
 ```
 
-确认用户名、私钥权限、远程路径和 `known_hosts` 后再重新导入。
+### `link add jp` 提示 target 尚未导入
+
+先导入 JP：
+
+```bash
+python3 deploy.py node import jp --services-file ./imports/jp-services.json
+```
+
+本机 TW 不需要导入。
+
+### `link add jp` 提示 target 有多个 proxy Service
+
+查看 target 的导入文件或 inventory 副本，再明确选择出口：
+
+```bash
+python3 deploy.py link add jp --exit-service xray-jp-main
+```
+
+target 只有一个 proxy 时会自动选择。
+
+### `apply` 提示 Link source 与当前机器不一致
+
+`tw-jp` 必须在从当前 `services.json` 识别为 `tw` 的服务器上应用：
+
+```bash
+python3 deploy.py apply --link tw-jp
+```
+
+不要把 TW 的整个 inventory 拷到 JP 后执行同一条 apply。
 
 ### `prepare` 后公钥仍不能登录
 
-先检查文件和权限：
+`prepare` 不安装公钥。先在 `.env` 填写 `SSH_KEY_1`，再以 root 执行：
+
+```bash
+python3 deploy.py init
+```
+
+然后检查权限和最终有效配置：
 
 ```bash
 sudo ls -ld /root/.ssh
 sudo ls -l /root/.ssh/authorized_keys
-sudo cat /root/.ssh/authorized_keys
-```
-
-期望目录为 `0700`、文件为 `0600`。然后检查语法和最终生效值：
-
-```bash
 sudo sshd -t
 sudo sshd -T | grep -E '^(pubkeyauthentication|authorizedkeysfile|permitrootlogin|passwordauthentication) '
 sudo systemctl status sshd.service
 sudo journalctl -u sshd.service -n 100 --no-pager
 ```
 
-默认公钥模式应看到 `pubkeyauthentication yes`、`.ssh/authorized_keys`，以及 `permitrootlogin without-password` 或 `prohibit-password`。脚本优先 reload `sshd.service`；系统只提供 `ssh.service` 时会自动回退。如果 `init` 提示没有 `SSH_KEY_*`，请编辑 `.env` 后重新执行 `init`。
-
-### 创建 Link 时报 `必须先切换为 host-l3 profile`
-
-```bash
-python3 deploy.py node update hk1 --network-profile host-l3
-python3 deploy.py node update us1 --network-profile host-l3
-```
-
-这只更新本地期望配置。当前版本不会自动迁移远程容器网络。
-
-### `apply` 报告暂不支持
-
-这是当前版本的预期行为。可以继续检查 Plan 和 staging 产物，但远程网络应用尚未开放。
+期望 `/root/.ssh` 为 `0700`，`authorized_keys` 为 `0600`。默认公钥模式应看到 `pubkeyauthentication yes`、`.ssh/authorized_keys`，以及 `permitrootlogin without-password` 或 `prohibit-password`。系统只提供 `ssh.service` 时脚本会自动回退。
 
 ## 开发验证
 
-远程运行不需要安装这些依赖。只有修改源码或运行测试时才需要：
+远程服务器不需要安装开发依赖。只有修改源码或运行测试时才需要：
 
 ```bash
 uv sync --locked
@@ -754,4 +872,4 @@ uv run mypy
 uv run pytest tests/ -v
 ```
 
-测试中包含单文件交付验证：在空临时目录中只复制 `deploy.py`，确认帮助命令、Node 创建和 topology 写入都不依赖项目内其他 Python 文件。
+测试包含单文件交付验证：在空临时目录中只复制 `deploy.py`，确认 CLI、Node/Link 状态和配置生成不依赖仓库内其他 Python 文件。
