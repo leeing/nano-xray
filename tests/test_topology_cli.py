@@ -265,11 +265,13 @@ class TopologyCliTests(unittest.TestCase):
             item for item in applied["outbounds"] if item.get("tag") == "link.tw-jp"
         )
         self.assertEqual(outbound["settings"]["vnext"][0]["address"], "jp.example.com")
+        self.assertEqual(current.stat().st_mode & 0o777, 0o644)
         validate.assert_called_once()
         restart.assert_called_once_with("xray-tw")
         backups = list((self.root / "state" / "backups").glob("*/config.json"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text()), {"old": True})
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
 
         regenerated = self.root / "regenerated"
         with (
@@ -298,6 +300,7 @@ class TopologyCliTests(unittest.TestCase):
         ):
             run_safely(args.func, args)
         self.assertEqual(current.read_text(), before_failed_apply)
+        self.assertEqual(current.stat().st_mode & 0o777, 0o644)
         self.assertEqual(restart_with_rollback.call_count, 2)
 
     def test_link_rejects_target_that_was_not_imported(self) -> None:

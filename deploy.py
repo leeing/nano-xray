@@ -1191,10 +1191,11 @@ def _restart_xray_container(container: str) -> bool:
 
 
 def _replace_file(source: Path, destination: Path) -> None:
+    """Atomically install a config readable by the non-root Xray container."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".nano-xray.tmp")
     shutil.copyfile(source, temporary)
-    os.chmod(temporary, 0o600)
+    os.chmod(temporary, 0o644)
     os.replace(temporary, destination)
 
 

@@ -505,6 +505,8 @@ python3 deploy.py apply --link tw-jp
 8. 只强制重建 `xray-tw` 容器，并检查它是否处于 Running 状态。
 9. 失败时恢复旧配置并重新启动原容器。
 
+运行配置权限为 `0644`，使固定镜像中的非 root Xray 用户能够读取 bind mount；`state/backups/` 中的备份仍为 `0600`。如果旧版 `apply` 后容器日志出现 `open /etc/xray/config.json: permission denied`，先执行 `chmod 0644 generated/xray/xray-tw/config.json` 恢复服务，再更新 `deploy.py`。
+
 `apply` 不修改 Caddy、其他 Xray 容器或 JP。如果本机还没有生成运行配置，会要求先执行：
 
 ```bash
