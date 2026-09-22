@@ -358,6 +358,16 @@ Link UUID 与 source 原有直连 UUID 不同。Xray 根据 Link UUID 识别该�
 
 项目目前没有 Surge 自动导出命令，需要按上述字段手工创建客户端条目。Link UUID 持久保存在 `inventory/topology.json`，不要公开或随意修改该文件。
 
+创建后随时可以按 target Node ID 或完整 Link ID 查询一条 Link 的客户端参数：
+
+```bash
+python3 deploy.py link show jp
+# 或
+python3 deploy.py link show tw-jp
+```
+
+输出包括 source 域名和公网端口、Link UUID、可用协议、VLESS/VMess WS path、TLS/SNI/Host，以及 source 连接 target 使用的域名、端口、协议和 path。客户端使用的是“客户端连接 source”一节；“source 连接 target”一节只用于检查第二跳配置。
+
 ## 本机 Node + Link
 
 ### 工作模型
@@ -715,6 +725,7 @@ sudo ufw allow 443/udp
 | `link add <target>` | 自动建立本机到 target 的 Link 期望配置 |
 | `link del <target>` | 删除本机到 target 的 Link 期望配置 |
 | `link list` | 查看活动 Link |
+| `link show <target或ID>` | 查看 Link UUID、WS path 和两跳连接参数 |
 | `link enable/disable <ID>` | 启用或停用 Link 期望配置 |
 | `apply --link <ID>` | 在本机校验并应用该 source 的全部 Link；失败自动回滚 |
 | `plan` | 可选生成独立审查草稿，不修改运行配置 |
@@ -724,6 +735,7 @@ sudo ufw allow 443/udp
 ```bash
 python3 deploy.py --help
 python3 deploy.py link add --help
+python3 deploy.py link show --help
 python3 deploy.py apply --help
 ```
 

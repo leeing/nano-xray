@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -106,6 +108,15 @@ class TopologyCliTests(unittest.TestCase):
         self.run_command("link", "add", "us1")
         with self.assertRaises(SystemExit):
             self.run_command("link", "add", "us1")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.run_command("link", "show", "us1")
+        shown = output.getvalue()
+        self.assertIn("Link: hk1-us1 (hk1 -> us1)", shown)
+        self.assertIn("UUID: ", shown)
+        self.assertIn("VLESS WS path: /hk1-vless", shown)
+        self.assertIn("VMess WS path: /hk1-vmess", shown)
+        self.assertIn("服务器: us1.example.com", shown)
         self.run_command("plan", "--links", "hk1-us1", "--save", "plans/link.json")
 
         topology = json.loads((self.root / "inventory" / "topology.json").read_text())

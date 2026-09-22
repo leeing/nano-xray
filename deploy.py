@@ -1058,6 +1058,51 @@ def cmd_link(args: argparse.Namespace) -> None:
             )
         return
 
+    if args.link_action == "show":
+        topology = store.load()
+        selected = topology.link(args.link)
+        if selected is None:
+            matches = [link for link in topology.links if link.target == args.link]
+            if len(matches) == 1:
+                selected = matches[0]
+            elif len(matches) > 1:
+                raise ValidationError(
+                    f"有多条 Link 指向 {args.link}，请改用完整 Link ID"
+                )
+        if selected is None:
+            raise ValidationError(f"Link 不存在: {args.link}")
+
+        source = topology.node(selected.source)
+        target = topology.node(selected.target)
+        if source is None or target is None:
+            raise ValidationError(f"Link {selected.id} 引用了不存在的 Node")
+        entry = _find_proxy_service(root, source, selected.entry_service)
+        exit_proxy = _find_proxy_service(root, target, selected.exit_service)
+        source_domain = str(entry.get("domain", ""))
+        target_domain = str(exit_proxy.get("domain", ""))
+        if not source_domain or not target_domain:
+            raise ValidationError(f"Link {selected.id} 的 Service 缺少 domain")
+
+        print(f"Link: {selected.id} ({selected.source} -> {selected.target})")
+        print(f"状态: {'enabled' if selected.enabled else 'disabled'}")
+        print("客户端连接 source:")
+        print(f"  服务器: {source_domain}")
+        print(f"  端口: {_service_public_port(entry)}")
+        print(f"  UUID: {selected.client_uuid}")
+        print(f"  协议: {selected.protocol}")
+        if selected.protocol in {"vless", "both"}:
+            print(f"  VLESS WS path: {entry['vless_ws_path']}")
+        if selected.protocol in {"vmess", "both"}:
+            print(f"  VMess WS path: {entry['vmess_ws_path']}")
+        print(f"  TLS/SNI/Host: {source_domain}")
+        print("source 连接 target:")
+        print(f"  服务器: {target_domain}")
+        print(f"  端口: {_service_public_port(exit_proxy)}")
+        print(f"  协议: {selected.exit_protocol}")
+        print(f"  WS path: {exit_proxy[f'{selected.exit_protocol}_ws_path']}")
+        print(f"  TLS/SNI/Host: {target_domain}")
+        return
+
     with store.locked():
         topology = store.load()
         if args.link_action == "add":
@@ -1372,6 +1417,8 @@ def add_topology_parsers(
         action_parser = link_sub.add_parser(action)
         action_parser.add_argument("link_id")
     link_sub.add_parser("list")
+    show = link_sub.add_parser("show", help="显示一条 Link 的完整连接参数")
+    show.add_argument("link", help="target Node ID 或完整 Link ID")
 
     plan = sub.add_parser("plan", help="生成可选审查计划，不修改运行配置")
     plan.add_argument("--nodes", default="", help="逗号分隔的 Node ID")
