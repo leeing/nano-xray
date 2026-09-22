@@ -433,6 +433,22 @@ def _find_proxy_service(root: Path, node: Node, service_name: str) -> dict[str, 
     raise ValidationError(f"Node {node.id} 不存在 proxy Service: {service_name}")
 
 
+def _service_public_port(service: dict[str, Any]) -> int:
+    """Return the public TLS port advertised by an imported proxy Service."""
+    value = service.get("public_port", 443)
+    if isinstance(value, bool):
+        raise ValidationError("proxy Service 的 public_port 必须是 1-65535 的整数")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            "proxy Service 的 public_port 必须是 1-65535 的整数"
+        ) from exc
+    if port < 1 or port > 65535:
+        raise ValidationError("proxy Service 的 public_port 必须是 1-65535 的整数")
+    return port
+
+
 def _link_outbound(
     root: Path, topology: Topology, link: Link, tag: str
 ) -> dict[str, Any]:
@@ -451,7 +467,15 @@ def _link_outbound(
     return {
         "tag": tag,
         "protocol": link.exit_protocol,
-        "settings": {"vnext": [{"address": domain, "port": 443, "users": [user]}]},
+        "settings": {
+            "vnext": [
+                {
+                    "address": domain,
+                    "port": _service_public_port(service),
+                    "users": [user],
+                }
+            ]
+        },
         "streamSettings": {
             "network": "ws",
             "security": "tls",

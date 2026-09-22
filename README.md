@@ -532,6 +532,29 @@ python3 deploy.py apply --link tw-jp
 
 重复导入会更新 JP 的 inventory 副本，但保留现有 Link ID 和 Link 客户端 UUID。`apply` 后 TW 才会使用 JP 的新连接参数。
 
+如果 target 的公网 TLS 端口不是 `443`，在复制过来的 `services.json` 中给对应的 proxy Service 增加 `public_port`。例如 JP 通过 `8443` 提供 TLS + WebSocket：
+
+```json
+{
+  "type": "proxy",
+  "domain": "jp.qadmlee.com",
+  "public_port": 8443,
+  "uuid": "目标节点的 UUID",
+  "vless_ws_path": "/目标节点的-vless-path",
+  "vmess_ws_path": "/目标节点的-vmess-path",
+  "container_name": "xray-jp"
+}
+```
+
+然后正常导入并应用：
+
+```bash
+python3 deploy.py node import jp --services-file ./imports/jp-services.json
+python3 deploy.py apply --link tw-jp
+```
+
+未填写 `public_port` 时默认使用 `443`。这里填写的是 target 对外提供 TLS + WebSocket 的公网端口，不是 Caddy 转发到 Xray 的内部 `2001/2002` 端口。非 443 端口必须已在 target 的 Caddy（或其他 TLS 入口）、Docker 端口映射、云防火墙和系统防火墙中放行，并继续使用相同的域名、SNI 和 WebSocket path。当前 Link 不支持直接连接未加 TLS 的公网 Xray WS 端口。
+
 ### 启用、停用和删除 Link
 
 查看 Link：
@@ -830,6 +853,16 @@ python3 deploy.py link add jp --exit-service xray-jp-main
 ```
 
 target 只有一个 proxy 时会自动选择。
+
+### target 使用的公网端口不是 443
+
+在待导入的 target `services.json` 对应 proxy Service 中加入：
+
+```json
+"public_port": 8443
+```
+
+重新执行 `node import` 和 `apply`。不要把 `public_port` 写成 Xray 容器内部的 `2001` 或 `2002`；Link 连接的是 target 的公网 TLS 入口。
 
 ### `apply` 提示 Link source 与当前机器不一致
 

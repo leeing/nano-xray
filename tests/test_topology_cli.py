@@ -240,6 +240,9 @@ class TopologyCliTests(unittest.TestCase):
         jp_services.write_text(
             json.dumps(self.services("jp", "aee492de-7dbe-4d2f-b891-6aa0dfb1297b"))
         )
+        jp_payload = json.loads(jp_services.read_text())
+        jp_payload["services"][0]["public_port"] = 8443
+        jp_services.write_text(json.dumps(jp_payload))
         self.run_command("node", "import", "jp", "--services-file", str(jp_services))
         self.run_command("link", "add", "jp")
 
@@ -265,6 +268,7 @@ class TopologyCliTests(unittest.TestCase):
             item for item in applied["outbounds"] if item.get("tag") == "link.tw-jp"
         )
         self.assertEqual(outbound["settings"]["vnext"][0]["address"], "jp.example.com")
+        self.assertEqual(outbound["settings"]["vnext"][0]["port"], 8443)
         self.assertEqual(current.stat().st_mode & 0o777, 0o644)
         validate.assert_called_once()
         restart.assert_called_once_with("xray-tw")
